@@ -24,13 +24,14 @@ impl TypeScriptAnalyzer {
         let source = fs::read_to_string(path)?;
         let mut parser = Parser::new();
         parser.set_language(language_typescript())?;
-        
-        let tree = parser.parse(&source, None)
+
+        let tree = parser
+            .parse(&source, None)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse {}", path))?;
-            
+
         let engine = ComplexityEngine::new(&source, path);
         let functions = engine.analyze(tree.root_node());
-        
+
         Ok(functions)
     }
 }

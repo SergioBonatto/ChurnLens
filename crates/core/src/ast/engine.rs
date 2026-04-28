@@ -46,9 +46,9 @@ impl<'a> ComplexityEngine<'a> {
     pub fn analyze(&self, root_node: Node) -> Vec<FunctionMetrics> {
         let mut functions = Vec::new();
         let mut cursor = QueryCursor::new();
-        
+
         let matches = cursor.matches(&FUNCTION_QUERY, root_node, self.source.as_bytes());
-        
+
         for m in matches {
             for capture in m.captures {
                 if let Some(metrics) = self.extract_metrics(capture.node) {
@@ -56,7 +56,7 @@ impl<'a> ComplexityEngine<'a> {
                 }
             }
         }
-        
+
         functions
     }
 
@@ -90,22 +90,29 @@ impl<'a> ComplexityEngine<'a> {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "identifier" || child.kind() == "property_identifier" {
-                return child.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>");
+                return child
+                    .utf8_text(self.source.as_bytes())
+                    .unwrap_or("<unknown>");
             }
         }
 
         if let Some(parent) = node.parent() {
-            if parent.kind() == "variable_declarator" || parent.kind() == "public_field_definition" {
+            if parent.kind() == "variable_declarator" || parent.kind() == "public_field_definition"
+            {
                 let mut p_cursor = parent.walk();
                 for child in parent.children(&mut p_cursor) {
                     if child.kind() == "identifier" || child.kind() == "property_identifier" {
-                        return child.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>");
+                        return child
+                            .utf8_text(self.source.as_bytes())
+                            .unwrap_or("<unknown>");
                     }
                 }
             }
             if parent.kind() == "assignment_expression" {
                 if let Some(left) = parent.child_by_field_name("left") {
-                    return left.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>");
+                    return left
+                        .utf8_text(self.source.as_bytes())
+                        .unwrap_or("<unknown>");
                 }
             }
         }
@@ -126,15 +133,24 @@ impl<'a> ComplexityEngine<'a> {
         (cognitive, max_depth)
     }
 
-    fn walk_cognitive(&self, node: Node, depth: u32, cognitive: &mut u32, max_depth: &mut u32, last_op: Option<&str>) {
+    fn walk_cognitive(
+        &self,
+        node: Node,
+        depth: u32,
+        cognitive: &mut u32,
+        max_depth: &mut u32,
+        last_op: Option<&str>,
+    ) {
         let kind = node.kind();
         let mut new_depth = depth;
         let mut increment = 0;
 
         match kind {
-            "if_statement" | "for_statement" | "while_statement" | "do_statement" | "switch_statement" | "catch_clause" | "ternary_expression" => {
-                let is_else_if = kind == "if_statement" && node.parent().map_or(false, |p| p.kind() == "else_clause");
-                
+            "if_statement" | "for_statement" | "while_statement" | "do_statement"
+            | "switch_statement" | "catch_clause" | "ternary_expression" => {
+                let is_else_if = kind == "if_statement"
+                    && node.parent().map_or(false, |p| p.kind() == "else_clause");
+
                 if is_else_if {
                     increment = 1;
                 } else {
@@ -152,7 +168,13 @@ impl<'a> ComplexityEngine<'a> {
                         }
                         let mut walk_cursor = node.walk();
                         for inner_child in node.children(&mut walk_cursor) {
-                            self.walk_cognitive(inner_child, new_depth, cognitive, max_depth, Some(op));
+                            self.walk_cognitive(
+                                inner_child,
+                                new_depth,
+                                cognitive,
+                                max_depth,
+                                Some(op),
+                            );
                         }
                         return;
                     }

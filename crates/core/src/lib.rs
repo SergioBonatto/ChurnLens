@@ -7,14 +7,20 @@ pub mod metrics;
 use anyhow::Result;
 use ast::parser::TypeScriptAnalyzer;
 use cache::CacheManager;
+use chrono::Utc;
 use git::GitAnalyzer;
 use git2::Repository;
 use ignore::WalkBuilder;
-use metrics::{FunctionMetrics, Report, AnalysisMetadata, SummaryStats, MaxValues, Distributions, NormalizedMetrics, RiskMetrics, PercentileMetrics};
+use metrics::{
+    AnalysisMetadata, Distributions, FunctionMetrics, MaxValues, NormalizedMetrics,
+    PercentileMetrics, Report, RiskMetrics, SummaryStats,
+};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use chrono::Utc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 const SCHEMA_VERSION: &str = "0.1.0";
 
@@ -33,12 +39,12 @@ pub fn analyze_repository(
 
     let cache_manager = CacheManager::new(repo_path);
     let mut cache = cache_manager.load();
-    
+
     // Análise Incremental de Git preservando integridade de autores
     let git_cache = GitAnalyzer::get_all_file_metrics(
-        &repo, 
-        cache.git_cache.clone(), 
-        cache.last_commit_oid.clone()
+        &repo,
+        cache.git_cache.clone(),
+        cache.last_commit_oid.clone(),
     )?;
 
     let new_cache_files = Arc::new(Mutex::new(HashMap::new()));
@@ -78,13 +84,16 @@ pub fn analyze_repository(
                     if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
                         if let Ok(rel_path) = path.strip_prefix(&repo_path_abs) {
                             let rel_path_str = rel_path.to_string_lossy().to_string();
-                            
-                            let current_oid = GitAnalyzer::get_file_oid_tls(&repo_path_abs, rel_path)
-                                .unwrap_or(None)
-                                .map(|o| o.to_string())
-                                .unwrap_or_default();
 
-                            let mut functions = if let Some((cached_oid, cached_funcs)) = cache.files.get(&rel_path_str) {
+                            let current_oid =
+                                GitAnalyzer::get_file_oid_tls(&repo_path_abs, rel_path)
+                                    .unwrap_or(None)
+                                    .map(|o| o.to_string())
+                                    .unwrap_or_default();
+
+                            let mut functions = if let Some((cached_oid, cached_funcs)) =
+                                cache.files.get(&rel_path_str)
+                            {
                                 if cached_oid == &current_oid && !current_oid.is_empty() {
                                     cached_funcs.clone()
                                 } else {
@@ -127,7 +136,10 @@ pub fn analyze_repository(
     });
 
     // Análise Estatística Global
-    let mut functions = Arc::try_unwrap(all_functions).unwrap().into_inner().unwrap();
+    let mut functions = Arc::try_unwrap(all_functions)
+        .unwrap()
+        .into_inner()
+        .unwrap();
     if functions.is_empty() {
         log::warn!("No functions found to analyze.");
         return Ok(());
@@ -135,8 +147,16 @@ pub fn analyze_repository(
 
     // 1. Cálculo de Max e Distribuição Percentil
     let max_values = MaxValues {
-        cyclomatic: functions.iter().map(|f| f.cyclomatic_complexity).max().unwrap_or(1),
-        cognitive: functions.iter().map(|f| f.cognitive_complexity).max().unwrap_or(1),
+        cyclomatic: functions
+            .iter()
+            .map(|f| f.cyclomatic_complexity)
+            .max()
+            .unwrap_or(1),
+        cognitive: functions
+            .iter()
+            .map(|f| f.cognitive_complexity)
+            .max()
+            .unwrap_or(1),
         churn: functions.iter().map(|f| f.churn_score).fold(0.0, f64::max),
         loc: functions.iter().map(|f| f.lines_of_code).max().unwrap_or(1),
     };
@@ -169,11 +189,36 @@ pub fn analyze_repository(
     let auth_p99 = auth_vals[p99_idx] as f64;
 
     // Normalização com proteção contra outliers
-    let cap_cog = if (max_values.cognitive as f64) > 3.0 * cognitive_p95 { cognitive_p99 } else { max_values.cognitive as f64 }.max(1.0);
-    let cap_churn = if max_values.churn > 3.0 * churn_p95 { churn_p99 } else { max_values.churn }.max(1.0);
-    let cap_loc = if (max_values.loc as f64) > 3.0 * loc_p95 { loc_p99 } else { max_values.loc as f64 }.max(1.0);
-    let cap_cyc = if (max_values.cyclomatic as f64) > 3.0 * cyc_p95 { cyc_p99 } else { max_values.cyclomatic as f64 }.max(1.0);
-    let cap_auth = if (auth_vals.iter().max().cloned().unwrap_or(0) as f64) > 3.0 * auth_p95 { auth_p99 } else { *auth_vals.iter().max().unwrap_or(&0) as f64 }.max(1.0);
+    let cap_cog = if (max_values.cognitive as f64) > 3.0 * cognitive_p95 {
+        cognitive_p99
+    } else {
+        max_values.cognitive as f64
+    }
+    .max(1.0);
+    let cap_churn = if max_values.churn > 3.0 * churn_p95 {
+        churn_p99
+    } else {
+        max_values.churn
+    }
+    .max(1.0);
+    let cap_loc = if (max_values.loc as f64) > 3.0 * loc_p95 {
+        loc_p99
+    } else {
+        max_values.loc as f64
+    }
+    .max(1.0);
+    let cap_cyc = if (max_values.cyclomatic as f64) > 3.0 * cyc_p95 {
+        cyc_p99
+    } else {
+        max_values.cyclomatic as f64
+    }
+    .max(1.0);
+    let cap_auth = if (auth_vals.iter().max().cloned().unwrap_or(0) as f64) > 3.0 * auth_p95 {
+        auth_p99
+    } else {
+        *auth_vals.iter().max().unwrap_or(&0) as f64
+    }
+    .max(1.0);
 
     // 2. Cálculo de scores de risco
     for func in &mut functions {
@@ -191,7 +236,11 @@ pub fn analyze_repository(
             authors: norm_auth,
         });
 
-        let base_score = (0.35 * norm_cog) + (0.15 * norm_cyc) + (0.30 * norm_churn) + (0.10 * norm_loc) + (0.10 * norm_auth);
+        let base_score = (0.35 * norm_cog)
+            + (0.15 * norm_cyc)
+            + (0.30 * norm_churn)
+            + (0.10 * norm_loc)
+            + (0.10 * norm_auth);
         let nesting_penalty = 1.0 + (func.nesting_depth as f64 / 4.0).powi(2) * 0.20;
         let final_score = base_score * nesting_penalty;
 
@@ -205,7 +254,10 @@ pub fn analyze_repository(
     }
 
     // 3. Cálculo de Rankings Percentis e Metadados de Risco
-    let mut risk_vals: Vec<f64> = functions.iter().map(|f| f.risk.as_ref().unwrap().final_score).collect();
+    let mut risk_vals: Vec<f64> = functions
+        .iter()
+        .map(|f| f.risk.as_ref().unwrap().final_score)
+        .collect();
     risk_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let total_funcs = functions.len() as f64;
@@ -214,12 +266,17 @@ pub fn analyze_repository(
         let churn = func.churn_score;
         let cog = func.cognitive_complexity as f64;
 
-        let risk_pct = (risk_vals.iter().position(|&v| v >= risk_score).unwrap_or(0) as f64 / total_funcs) * 100.0;
-        
+        let risk_pct = (risk_vals.iter().position(|&v| v >= risk_score).unwrap_or(0) as f64
+            / total_funcs)
+            * 100.0;
+
         func.percentile = Some(PercentileMetrics {
             risk: risk_pct,
-            churn: (churn_vals.iter().position(|&v| v >= churn).unwrap_or(0) as f64 / total_funcs) * 100.0,
-            cognitive: (cog_vals.iter().position(|&v| v >= cog as u32).unwrap_or(0) as f64 / total_funcs) * 100.0,
+            churn: (churn_vals.iter().position(|&v| v >= churn).unwrap_or(0) as f64 / total_funcs)
+                * 100.0,
+            cognitive: (cog_vals.iter().position(|&v| v >= cog as u32).unwrap_or(0) as f64
+                / total_funcs)
+                * 100.0,
         });
 
         let level = match risk_pct {
@@ -227,7 +284,8 @@ pub fn analyze_repository(
             p if p > 80.0 => "high",
             p if p > 50.0 => "medium",
             _ => "low",
-        }.to_string();
+        }
+        .to_string();
 
         if let Some(norm) = &func.normalized {
             let mut drivers = vec![
@@ -245,7 +303,7 @@ pub fn analyze_repository(
 
     // Geração do Report Final
     let risk_p95 = risk_vals[p95_idx];
-    
+
     let report = Report {
         schema_version: SCHEMA_VERSION.to_string(),
         analysis: AnalysisMetadata {
@@ -271,7 +329,10 @@ pub fn analyze_repository(
     }
 
     // Finaliza cache com integridade Git total
-    let new_files = Arc::try_unwrap(new_cache_files).unwrap().into_inner().unwrap();
+    let new_files = Arc::try_unwrap(new_cache_files)
+        .unwrap()
+        .into_inner()
+        .unwrap();
     cache.files = new_files;
     cache.git_cache = git_cache;
     cache.last_commit_oid = Some(commit_hash);

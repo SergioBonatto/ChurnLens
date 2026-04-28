@@ -2,8 +2,8 @@ use anyhow::Result;
 use churnlens::analyze_repository;
 use clap::Parser;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "churnlens")]
@@ -48,12 +48,7 @@ fn main() -> Result<()> {
         r.store(true, Ordering::SeqCst);
     })?;
 
-    analyze_repository(
-        &args.path,
-        &args.sort,
-        args.limit,
-        shutdown,
-    )?;
+    analyze_repository(&args.path, &args.sort, args.limit, shutdown)?;
 
     Ok(())
 }

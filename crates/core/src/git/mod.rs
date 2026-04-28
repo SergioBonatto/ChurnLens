@@ -1,11 +1,11 @@
-use crate::metrics::ChurnMetrics;
 use crate::cache::GitCacheEntry;
+use crate::metrics::ChurnMetrics;
+use aho_corasick::AhoCorasick;
 use anyhow::Result;
-use git2::{Commit, Repository, Oid, DiffOptions};
+use git2::{Commit, DiffOptions, Oid, Repository};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use aho_corasick::AhoCorasick;
-use std::cell::RefCell;
 
 pub struct GitAnalyzer;
 
@@ -57,7 +57,8 @@ impl GitAnalyzer {
 
     pub fn compute_churn_metrics(cache_entry: &GitCacheEntry) -> ChurnMetrics {
         let authors_count = cache_entry.authors.len().max(1);
-        let churn_score = (cache_entry.times_modified as f64 + (cache_entry.bug_fix_commits as f64 * 2.0)) 
+        let churn_score = (cache_entry.times_modified as f64
+            + (cache_entry.bug_fix_commits as f64 * 2.0))
             * (authors_count as f64 + 1.0).log10();
 
         ChurnMetrics {
@@ -76,13 +77,14 @@ impl GitAnalyzer {
             // Comparamos com o primeiro pai para rastrear a evolução linear
             let parent = commit.parent(0)?;
             let parent_tree = parent.tree()?;
-            
+
             let mut opts = DiffOptions::new();
             opts.pathspec("*");
             opts.context_lines(0);
 
-            let diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&current_tree), Some(&mut opts))?;
-            
+            let diff =
+                repo.diff_tree_to_tree(Some(&parent_tree), Some(&current_tree), Some(&mut opts))?;
+
             for delta in diff.deltas() {
                 if let Some(path) = delta.new_file().path() {
                     if let Some(path_str) = path.to_str() {
@@ -113,11 +115,11 @@ impl GitAnalyzer {
                 *opt = Some(Repository::open(repo_path)?);
             }
             let repo = opt.as_ref().unwrap();
-            
+
             // Otimização: peel_to_commit uma única vez por HEAD
             let head = repo.head()?.peel_to_commit()?;
             let tree = head.tree()?;
-            
+
             match tree.get_path(rel_path) {
                 Ok(entry) => Ok(Some(entry.id())),
                 Err(_) => Ok(None),

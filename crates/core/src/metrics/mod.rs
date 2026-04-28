@@ -33,6 +33,8 @@ pub struct RiskMetrics {
     pub base_score: f64,
     pub nesting_penalty: f64,
     pub final_score: f64,
+    pub level: String, // "low", "medium", "high", "critical"
+    pub primary_driver: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,10 +46,18 @@ pub struct PercentileMetrics {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
-    pub repository: String,
-    pub timestamp: String,
+    pub schema_version: String,
+    pub analysis: AnalysisMetadata,
     pub summary: SummaryStats,
     pub functions: Vec<FunctionMetrics>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AnalysisMetadata {
+    pub repository: String,
+    pub commit: String,
+    pub branch: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,7 +82,7 @@ pub struct Distributions {
     pub cognitive_p95: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChurnMetrics {
     pub times_modified: usize,
     pub bug_fix_commits: usize,

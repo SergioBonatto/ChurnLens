@@ -1,7 +1,7 @@
 use crate::metrics::FunctionMetrics;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,15 @@ const CACHE_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Default)]
 pub struct AnalysisCache {
     pub files: HashMap<String, (String, Vec<FunctionMetrics>)>,
+    pub git_cache: HashMap<String, GitCacheEntry>,
+    pub last_commit_oid: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GitCacheEntry {
+    pub times_modified: usize,
+    pub bug_fix_commits: usize,
+    pub authors: HashSet<String>,
 }
 
 #[derive(Serialize, Deserialize)]

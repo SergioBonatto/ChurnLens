@@ -93,6 +93,23 @@ impl<'a> ComplexityEngine<'a> {
                 return child.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>");
             }
         }
+
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "variable_declarator" || parent.kind() == "public_field_definition" {
+                let mut p_cursor = parent.walk();
+                for child in parent.children(&mut p_cursor) {
+                    if child.kind() == "identifier" || child.kind() == "property_identifier" {
+                        return child.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>");
+                    }
+                }
+            }
+            if parent.kind() == "assignment_expression" {
+                if let Some(left) = parent.child_by_field_name("left") {
+                    return left.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>");
+                }
+            }
+        }
+
         "<anonymous>"
     }
 
@@ -105,27 +122,39 @@ impl<'a> ComplexityEngine<'a> {
     fn calculate_cognitive_and_nesting(&self, node: Node) -> (u32, u32) {
         let mut cognitive = 0;
         let mut max_depth = 0;
-        self.walk_cognitive(node, 0, &mut cognitive, &mut max_depth);
+        self.walk_cognitive(node, 0, &mut cognitive, &mut max_depth, None);
         (cognitive, max_depth)
     }
 
-    fn walk_cognitive(&self, node: Node, depth: u32, cognitive: &mut u32, max_depth: &mut u32) {
+    fn walk_cognitive(&self, node: Node, depth: u32, cognitive: &mut u32, max_depth: &mut u32, last_op: Option<&str>) {
         let kind = node.kind();
         let mut new_depth = depth;
         let mut increment = 0;
 
         match kind {
             "if_statement" | "for_statement" | "while_statement" | "do_statement" | "switch_statement" | "catch_clause" | "ternary_expression" => {
-                increment = 1 + depth;
-                new_depth += 1;
+                let is_else_if = kind == "if_statement" && node.parent().map_or(false, |p| p.kind() == "else_clause");
+                
+                if is_else_if {
+                    increment = 1;
+                } else {
+                    increment = 1 + depth;
+                    new_depth += 1;
+                }
             }
             "binary_expression" => {
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     let op = child.kind();
                     if op == "&&" || op == "||" {
-                        increment = 1;
-                        break;
+                        if last_op != Some(op) {
+                            *cognitive += 1;
+                        }
+                        let mut walk_cursor = node.walk();
+                        for inner_child in node.children(&mut walk_cursor) {
+                            self.walk_cognitive(inner_child, new_depth, cognitive, max_depth, Some(op));
+                        }
+                        return;
                     }
                 }
             }
@@ -139,7 +168,7 @@ impl<'a> ComplexityEngine<'a> {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.walk_cognitive(child, new_depth, cognitive, max_depth);
+            self.walk_cognitive(child, new_depth, cognitive, max_depth, None);
         }
     }
 }

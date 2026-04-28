@@ -1,72 +1,113 @@
-# ChurnLens: High-Performance Code Telemetry (WIP)
+# ChurnLens
 
-ChurnLens is a specialized static analysis engine designed to quantify technical debt and stability risks in TypeScript and JavaScript repositories. It correlates Abstract Syntax Tree (AST) complexity with historical Git metadata to identify high-risk hotspots.
+ChurnLens is a high-performance code risk telemetry engine implemented in Rust. It correlates Abstract Syntax Tree (AST) complexity with historical change patterns to produce structured, normalized data for TypeScript and JavaScript repositories.
 
-## Core Architecture
+This engine is designed as a **data producer** for downstream systems such as SaaS platforms, CI pipelines, and autonomous agents.
 
-The engine is implemented in Rust, utilizing a two-pass analysis pipeline to provide globally normalized risk metrics across entire repositories.
+---
 
-### 1. Static Analysis Engine (AST)
-* **Query-Based Parsing:** Utilizes `tree-sitter` with declarative S-expression queries. This leverages the underlying C-engine's optimized search for identifying function boundaries and complexity points.
-* **Complexity Metrics:**
-    * **Cyclomatic Complexity:** Measures linearly independent paths via AST decision points.
-    * **Cognitive Complexity:** Implements a nesting-aware metric that penalizes deeply branched logic, providing a more accurate representation of maintainability.
-    * **Nesting Depth:** Tracks the maximum depth of control structures to identify deeply nested, brittle logic.
+## Scope
 
-### 2. Git Metadata Mining
-* **Single-Pass RevWalk:** Performs a single traversal of the repository history ($O(\text{Commits} + \text{Files})$). Metadata is aggregated into a hash-mapped cache, eliminating the bottleneck of per-function history queries.
-* **Refined Churn Calculation:** Implements a logarithmic weighting for bug fixes and contributor counts to dampen noise and highlight true hotspots.
+ChurnLens generates function-level telemetry including:
 
-### 3. Global Normalization and Risk Scoring
-Unlike traditional tools that provide raw numbers, ChurnLens performs a **global statistical pass** before reporting:
-* **Outlier Protection:** Uses a capped normalization strategy. If a metric's maximum is an extreme outlier (>3x the 95th percentile), the denominator is capped at the 99th percentile to prevent "God Functions" from squashing the risk scores of other code.
-* **Percentile Ranking:** Every function is assigned a percentile rank for Risk, Churn, and Cognitive Complexity relative to the rest of the codebase.
-* **Exponential Penalties:** Applies non-linear penalties for high nesting depth ( $depth > 3$ ) to account for the exponential increase in cognitive load.
+* **Structural Complexity:** Cyclomatic and Cognitive metrics via `tree-sitter`.
+* **Historical Churn:** Volatility and bug-fix density via Git metadata.
+* **Global Normalization:** Metrics scaled [0.0, 1.0] relative to the repository.
+* **Risk Scoring:** Composite scores with exponential nesting penalties.
+* **Percentile Ranking:** Global rank (0–100) for risk, churn, and complexity.
 
-## Risk Scoring Model
-
-The `final_score` represents the total technical risk of a function:
-
-$$Risk = BaseScore \times (1.0 + (\frac{depth}{4})^2 \times 0.20)$$
-
-### Base Score Weights
-| Metric | Weight | Description |
-| :--- | :--- | :--- |
-| **Cognitive** | 0.35 | Logical density and nesting. |
-| **Churn** | 0.30 | Refined historical volatility. |
-| **Cyclomatic** | 0.15 | Structural branching paths. |
-| **LOC** | 0.10 | Raw surface area. |
-| **Authors** | 0.10 | Fragmentation of ownership. |
-
-### Refined Churn Formula
-$$churn\_score = (m + (b \times 2)) \times \log_{10}(a + 1)$$
-* **m**: Modification frequency.
-* **b**: Bug-fix commits.
-* **a**: Contributor count.
+---
 
 ## Installation
 
+### From crates.io
+```bash
+cargo install churnlens
+```
+
+### From source
 Build the optimized binary from the workspace root:
 
 ```bash
 cargo build --release
 ```
 
+The binary will be available at `./target/release/churnlens`.
+
+---
+
 ## Usage
 
 ```bash
-# Analyze repository and output full JSON report
-./target/release/churnlens [PATH] > report.json
+churnlens [PATH] > report.json
 ```
 
-### Output Format
-The tool produces a comprehensive JSON report containing:
-* **Summary Stats**: Total functions, global max values, and p95 distributions.
-* **Function Telemetry**: 
-    * `id`: Stable identifier (`file:name:line`).
-    * `normalized`: Metrics scaled 0.0–1.0 with outlier protection.
-    * `risk`: Base score, nesting penalty, and final score.
-    * `percentile`: Global rank (0–100) for risk, churn, and complexity.
+* `PATH`: Root of the Git repository to analyze (defaults to `.`).
+
+---
+
+## Core Architecture
+
+### 1. AST-Based Static Analysis
+* **Query-Based Parsing:** Uses `tree-sitter` declarative queries for high-performance extraction.
+* **Metrics:** Cyclomatic Complexity, Cognitive Complexity, Nesting Depth, and Lines of Code (LOC).
+
+### 2. Git Metadata Mining
+* **Single-Pass Traversal:** $O(\text{commits} + \text{files})$ complexity using `git2`.
+* **Refined Churn Formula:**
+  `churn_score = (modifications + (bug_fixes * 2)) * log10(authors + 1)`
+
+### 3. Global Normalization
+* **Outlier Protection:** If a metric's maximum is an extreme outlier (>3x p95), the denominator is capped at the 99th percentile to prevent score compression across the repository.
+* **Percentile Ranks:** Provides immediate context on how a function compares to the rest of the codebase.
+
+### 4. Risk Scoring
+Final risk is computed using weighted base metrics amplified by nesting depth:
+`Risk = BaseScore * (1.0 + (depth / 4)^2 * 0.20)`
+
+**Base Score Weights:** 35% Cognitive, 30% Churn, 15% Cyclomatic, 10% LOC, 10% Authors.
+
+---
+
+## Output Contract (JSON)
+
+ChurnLens produces a single, machine-consumable JSON document.
+
+### Top-Level Structure
+```json
+{
+  "repository": "string (path)",
+  "timestamp": "RFC3339",
+  "summary": {
+    "total_functions": integer,
+    "max_values": { "cyclomatic", "cognitive", "churn", "loc" },
+    "distributions": { "risk_p95", "churn_p95", "cognitive_p95" }
+  },
+  "functions": [ ... ]
+}
+```
+
+### Function Object
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `string` | Stable identifier (`file:name:line`). |
+| `name` | `string` | Function identifier or `<anonymous>`. |
+| `file` | `string` | Relative path from repository root. |
+| `line` | `u32` | Start line number. |
+| `churn_score` | `f64` | Refined historical volatility score. |
+| `normalized` | `object` | Fields scaled [0.0, 1.0] with outlier protection. |
+| `risk` | `object` | `base_score`, `nesting_penalty`, and `final_score`. |
+| `percentile` | `object` | Global rank (0.0 to 100.0) for risk, churn, and cognitive. |
+
+---
+
+## Characteristics
+
+* **Deterministic:** Output is consistent for a given repository state.
+* **Performance:** Multi-threaded analysis using `Rayon`.
+* **Non-Goals:** This tool does not provide interactive UI or human-readable text tables; it is strictly a JSON data provider.
+
+---
 
 ## License
 

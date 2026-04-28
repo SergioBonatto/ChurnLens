@@ -1,5 +1,5 @@
 use anyhow::Result;
-use churnlens_core::analyze_repository;
+use churnlens::analyze_repository;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;

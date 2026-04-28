@@ -1,4 +1,4 @@
- ChurnLens: High-Performance Code Telemetry
+# ChurnLens: High-Performance Code Telemetry (WIP)
 
 ChurnLens is a specialized static analysis engine designed to quantify technical debt and stability risks in TypeScript and JavaScript repositories. It correlates Abstract Syntax Tree (AST) complexity with historical Git metadata to identify high-risk hotspots.
 

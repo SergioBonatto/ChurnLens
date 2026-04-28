@@ -230,7 +230,7 @@ pub fn analyze_repository(
         }.to_string();
 
         if let Some(norm) = &func.normalized {
-            let mut drivers = vec![ // Reverted to vec! as per the error, will use array in next step if needed
+            let mut drivers = vec![
                 ("cognitive", norm.cognitive),
                 ("churn", norm.churn),
                 ("cyclomatic", norm.cyclomatic),

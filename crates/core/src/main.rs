@@ -2,6 +2,8 @@ use anyhow::Result;
 use churnlens_core::analyze_repository;
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser, Debug)]
 #[command(name = "churnlens")]
@@ -37,16 +39,20 @@ fn main() -> Result<()> {
             .init();
     }
 
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let r = shutdown.clone();
+
     // Set up graceful shutdown
     ctrlc::set_handler(move || {
-        log::warn!("Interrupted! Shutting down...");
-        std::process::exit(0);
+        log::warn!("Interrupted! Initiating graceful shutdown...");
+        r.store(true, Ordering::SeqCst);
     })?;
 
     analyze_repository(
         &args.path,
         &args.sort,
         args.limit,
+        shutdown,
     )?;
 
     Ok(())

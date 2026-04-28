@@ -5,10 +5,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const CACHE_MAGIC: &[u8; 4] = b"CHRN";
+const CACHE_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct AnalysisCache {
-    // Maps relative file path to (Git OID as string, List of FunctionMetrics)
     pub files: HashMap<String, (String, Vec<FunctionMetrics<'static>>)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VersionedCache {
+    magic: [u8; 4],
+    version: u32,
+    data: AnalysisCache,
 }
 
 pub struct CacheManager {
@@ -28,15 +37,22 @@ impl CacheManager {
 
     pub fn load(&self) -> AnalysisCache {
         if let Ok(data) = fs::read(&self.cache_path) {
-            if let Ok(cache) = bincode::deserialize(&data) {
-                return cache;
+            if let Ok(versioned) = bincode::deserialize::<VersionedCache>(&data) {
+                if &versioned.magic == CACHE_MAGIC && versioned.version == CACHE_VERSION {
+                    return versioned.data;
+                }
             }
         }
         AnalysisCache::default()
     }
 
-    pub fn save(&self, cache: &AnalysisCache) -> Result<()> {
-        let data = bincode::serialize(cache)?;
+    pub fn save(&self, cache: AnalysisCache) -> Result<()> {
+        let versioned = VersionedCache {
+            magic: *CACHE_MAGIC,
+            version: CACHE_VERSION,
+            data: cache,
+        };
+        let data = bincode::serialize(&versioned)?;
         fs::write(&self.cache_path, data)?;
         Ok(())
     }

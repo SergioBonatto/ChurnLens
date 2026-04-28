@@ -4,8 +4,13 @@ use git2::{Commit, Repository, Oid};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use aho_corasick::AhoCorasick;
+use std::cell::RefCell;
 
 pub struct GitAnalyzer;
+
+thread_local! {
+    static REPO_HANDLE: RefCell<Option<Repository>> = RefCell::new(None);
+}
 
 struct FileStats {
     times_modified: usize,
@@ -71,14 +76,21 @@ impl GitAnalyzer {
         Ok(result)
     }
 
-    pub fn get_file_oid(repo: &Repository, path: &Path) -> Result<Option<Oid>> {
-        let head = repo.head()?.peel_to_commit()?;
-        let tree = head.tree()?;
-        
-        match tree.get_path(path) {
-            Ok(entry) => Ok(Some(entry.id())),
-            Err(_) => Ok(None),
-        }
+    pub fn get_file_oid_tls(repo_path: &Path, rel_path: &Path) -> Result<Option<Oid>> {
+        REPO_HANDLE.with(|handle| {
+            let mut opt = handle.borrow_mut();
+            if opt.is_none() {
+                *opt = Some(Repository::open(repo_path)?);
+            }
+            let repo = opt.as_ref().unwrap();
+            let head = repo.head()?.peel_to_commit()?;
+            let tree = head.tree()?;
+            
+            match tree.get_path(rel_path) {
+                Ok(entry) => Ok(Some(entry.id())),
+                Err(_) => Ok(None),
+            }
+        })
     }
 
     fn is_bug_fix(commit: &Commit, ac: &AhoCorasick) -> bool {

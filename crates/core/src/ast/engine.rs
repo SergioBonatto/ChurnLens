@@ -1,6 +1,38 @@
 use crate::metrics::FunctionMetrics;
+use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use tree_sitter::{Node, Query, QueryCursor};
+
+static FUNCTION_QUERY: Lazy<Query> = Lazy::new(|| {
+    let query_str = r#"
+        [
+            (function_declaration) @func
+            (arrow_function) @func
+            (method_definition) @func
+            (function_expression) @func
+        ]
+    "#;
+    let language = tree_sitter_typescript::language_typescript();
+    Query::new(language, query_str).expect("Valid function query")
+});
+
+static COMPLEXITY_QUERY: Lazy<Query> = Lazy::new(|| {
+    let query_str = r#"
+        [
+            "if"
+            "for"
+            "while"
+            "do"
+            "case"
+            "catch"
+            "&&"
+            "||"
+            "?"
+        ] @item
+    "#;
+    let language = tree_sitter_typescript::language_typescript();
+    Query::new(language, query_str).expect("Valid complexity query")
+});
 
 pub struct ComplexityEngine<'a> {
     source: &'a str,
@@ -14,22 +46,9 @@ impl<'a> ComplexityEngine<'a> {
 
     pub fn analyze(&self, root_node: Node) -> Vec<FunctionMetrics<'a>> {
         let mut functions = Vec::new();
-        
-        // Query for function-like constructs
-        let query_str = r#"
-            [
-                (function_declaration) @func
-                (arrow_function) @func
-                (method_definition) @func
-                (function_expression) @func
-            ]
-        "#;
-        
-        let language = tree_sitter_typescript::language_typescript();
-        let query = Query::new(language, query_str).expect("Valid function query");
         let mut cursor = QueryCursor::new();
         
-        let matches = cursor.matches(&query, root_node, self.source.as_bytes());
+        let matches = cursor.matches(&FUNCTION_QUERY, root_node, self.source.as_bytes());
         
         for m in matches {
             for capture in m.captures {
@@ -50,7 +69,7 @@ impl<'a> ComplexityEngine<'a> {
         let lines_of_code = (node.end_position().row - node.start_position().row + 1) as u32;
 
         Some(FunctionMetrics {
-            name: Cow::Owned(name),
+            name: Cow::Borrowed(name),
             file: Cow::Borrowed(self.file_path),
             line,
             cyclomatic_complexity,
@@ -64,35 +83,19 @@ impl<'a> ComplexityEngine<'a> {
         })
     }
 
-    fn extract_name(&self, node: Node) -> String {
+    fn extract_name(&self, node: Node) -> &'a str {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "identifier" || child.kind() == "property_identifier" {
-                return child.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>").to_string();
+                return child.utf8_text(self.source.as_bytes()).unwrap_or("<unknown>");
             }
         }
-        "<anonymous>".to_string()
+        "<anonymous>"
     }
 
     fn calculate_cyclomatic_complexity(&self, node: Node) -> u32 {
-        let query_str = r#"
-            [
-                "if"
-                "for"
-                "while"
-                "do"
-                "case"
-                "catch"
-                "&&"
-                "||"
-                "?"
-            ] @item
-        "#;
-        let language = tree_sitter_typescript::language_typescript();
-        let query = Query::new(language, query_str).expect("Valid complexity query");
         let mut cursor = QueryCursor::new();
-        
-        let matches = cursor.matches(&query, node, self.source.as_bytes());
+        let matches = cursor.matches(&COMPLEXITY_QUERY, node, self.source.as_bytes());
         1 + matches.count() as u32
     }
 

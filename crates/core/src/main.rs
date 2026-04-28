@@ -11,15 +11,11 @@ struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Output file (JSON)
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// Sort by field (churn_score, cyclomatic_complexity, times_modified, nesting_depth, lines_of_code)
+    /// Sort by field (deprecated for streaming mode)
     #[arg(short, long, default_value = "churn_score")]
     sort: String,
 
-    /// Limit number of results
+    /// Limit number of results (deprecated for streaming mode)
     #[arg(short, long)]
     limit: Option<usize>,
 
@@ -41,20 +37,17 @@ fn main() -> Result<()> {
             .init();
     }
 
-    let report = analyze_repository(
+    // Set up graceful shutdown
+    ctrlc::set_handler(move || {
+        log::warn!("Interrupted! Shutting down...");
+        std::process::exit(0);
+    })?;
+
+    analyze_repository(
         &args.path,
         &args.sort,
         args.limit,
     )?;
-
-    if let Some(output_path) = args.output {
-        let json = serde_json::to_string_pretty(&report)?;
-        std::fs::write(&output_path, json)?;
-        println!("✅ Report saved to: {}", output_path.display());
-    } else {
-        let json = serde_json::to_string_pretty(&report)?;
-        println!("{}", json);
-    }
 
     Ok(())
 }

@@ -1,43 +1,53 @@
 pub mod ast;
+pub mod cache;
 pub mod error;
 pub mod git;
 pub mod metrics;
 
 use anyhow::Result;
 use ast::parser::TypeScriptAnalyzer;
+use cache::{AnalysisCache, CacheManager};
 use git::GitAnalyzer;
 use git2::Repository;
 use ignore::WalkBuilder;
-use metrics::{FunctionMetrics, Report, SummaryStats};
+use metrics::FunctionMetrics;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::borrow::Cow;
+use std::io::{self, Write};
 
 pub fn analyze_repository(
     repo_path: &Path,
-    sort_by: &str,
-    limit: Option<usize>,
-) -> Result<Report<'static>> {
+    _sort_by: &str,
+    _limit: Option<usize>,
+) -> Result<()> {
     log::info!("Analyzing repository: {}", repo_path.display());
 
     let repo = Repository::open(repo_path)?;
     let git_metrics = GitAnalyzer::get_all_file_metrics(&repo)?;
 
+    let cache_manager = CacheManager::new(repo_path);
+    let mut cache = cache_manager.load();
+    let new_cache_files = Arc::new(Mutex::new(HashMap::new()));
+
     let repo_path_abs = repo_path.canonicalize()?;
     
-    // Use ignore crate for efficient walking
     let walker = WalkBuilder::new(&repo_path_abs)
         .standard_filters(true)
-        .hidden(false) // we might want to see hidden files if they are JS/TS
+        .hidden(false)
         .build_parallel();
 
-    let all_functions = Arc::new(Mutex::new(Vec::new()));
+    let stdout = io::stdout();
+    let stdout_mutex = Arc::new(Mutex::new(stdout));
 
     walker.run(|| {
-        let all_functions = Arc::clone(&all_functions);
         let repo_path_abs = repo_path_abs.clone();
         let git_metrics = &git_metrics;
+        let cache = &cache;
+        let new_cache_files = Arc::clone(&new_cache_files);
+        let stdout_mutex = Arc::clone(&stdout_mutex);
+        let repo = Repository::open(&repo_path_abs).expect("Open repo in thread");
 
         Box::new(move |entry| {
             let entry = match entry {
@@ -52,28 +62,62 @@ pub fn analyze_repository(
 
             if let Some(ext) = path.extension() {
                 if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
-                    match TypeScriptAnalyzer::parse_file(path.to_str().unwrap()) {
-                        Ok(mut functions) => {
-                            if let Ok(rel_path) = path.strip_prefix(&repo_path_abs) {
-                                let rel_path_str = rel_path.to_string_lossy().to_string();
-                                if let Some(churn) = git_metrics.get(&rel_path_str) {
-                                    for func in &mut functions {
-                                        func.times_modified = churn.times_modified;
-                                        func.bug_fix_commits = churn.bug_fix_commits;
-                                        func.authors_count = churn.authors_count;
-                                        func.churn_score = churn.churn_score;
-                                        func.file = Cow::Owned(rel_path_str.clone());
-                                    }
-                                } else {
-                                    for func in &mut functions {
-                                        func.file = Cow::Owned(rel_path_str.clone());
-                                    }
+                    if let Ok(rel_path) = path.strip_prefix(&repo_path_abs) {
+                        let rel_path_str = rel_path.to_string_lossy().to_string();
+                        
+                        // Check cache
+                        let current_oid = GitAnalyzer::get_file_oid(&repo, rel_path)
+                            .unwrap_or(None)
+                            .map(|o| o.to_string())
+                            .unwrap_or_default();
+
+                        let mut functions = if let Some((cached_oid, cached_funcs)) = cache.files.get(&rel_path_str) {
+                            if cached_oid == &current_oid && !current_oid.is_empty() {
+                                cached_funcs.clone()
+                            } else {
+                                match TypeScriptAnalyzer::parse_file(path.to_str().unwrap()) {
+                                    Ok(f) => f,
+                                    Err(_) => return ignore::WalkState::Continue,
                                 }
                             }
-                            let mut all = all_functions.lock().unwrap();
-                            all.extend(functions);
+                        } else {
+                            match TypeScriptAnalyzer::parse_file(path.to_str().unwrap()) {
+                                Ok(f) => f,
+                                Err(_) => return ignore::WalkState::Continue,
+                            }
+                        };
+
+                        // Update with fresh churn metrics
+                        if let Some(churn) = git_metrics.get(&rel_path_str) {
+                            for func in &mut functions {
+                                func.times_modified = churn.times_modified;
+                                func.bug_fix_commits = churn.bug_fix_commits;
+                                func.authors_count = churn.authors_count;
+                                func.churn_score = churn.churn_score;
+                                func.file = Cow::Owned(rel_path_str.clone());
+                            }
+                        } else {
+                            for func in &mut functions {
+                                func.file = Cow::Owned(rel_path_str.clone());
+                            }
                         }
-                        Err(e) => log::warn!("Failed to parse {}: {}", path.display(), e),
+
+                        // Stream output (NDJSON)
+                        {
+                            let mut out = stdout_mutex.lock().unwrap();
+                            for func in &functions {
+                                if let Ok(json) = serde_json::to_string(func) {
+                                    let _ = writeln!(out, "{}", json);
+                                }
+                            }
+                            let _ = out.flush();
+                        }
+
+                        // Update new cache
+                        if !current_oid.is_empty() {
+                            let mut new_files = new_cache_files.lock().unwrap();
+                            new_files.insert(rel_path_str, (current_oid, functions));
+                        }
                     }
                 }
             }
@@ -82,80 +126,10 @@ pub fn analyze_repository(
         })
     });
 
-    let mut all_functions = Arc::try_unwrap(all_functions).unwrap().into_inner().unwrap();
+    // Finalize cache
+    let new_files = Arc::try_unwrap(new_cache_files).unwrap().into_inner().unwrap();
+    cache.files = new_files;
+    let _ = cache_manager.save(&cache);
 
-    let mut file_metrics: HashMap<String, usize> = HashMap::new();
-    for func in &all_functions {
-        *file_metrics.entry(func.file.to_string()).or_insert(0) +=
-            func.times_modified.max(1);
-    }
-
-    sort_functions(&mut all_functions, sort_by);
-
-    if let Some(limit) = limit {
-        all_functions.truncate(limit);
-    }
-
-    let summary = calculate_summary(&all_functions, &file_metrics);
-
-    let report = Report {
-        repository: repo_path_abs.to_string_lossy().to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        summary,
-        functions: all_functions,
-    };
-
-    Ok(report)
-}
-
-fn sort_functions(functions: &mut [FunctionMetrics], sort_by: &str) {
-    match sort_by {
-        "churn_score" => functions.sort_by(|a, b| {
-            b.churn_score.partial_cmp(&a.churn_score).unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        "cyclomatic_complexity" => functions.sort_by(|a, b| {
-            b.cyclomatic_complexity.cmp(&a.cyclomatic_complexity)
-        }),
-        "cognitive_complexity" => functions.sort_by(|a, b| {
-            b.cognitive_complexity.cmp(&a.cognitive_complexity)
-        }),
-        "times_modified" => functions.sort_by(|a, b| {
-            b.times_modified.cmp(&a.times_modified)
-        }),
-        "nesting_depth" => functions.sort_by(|a, b| {
-            b.nesting_depth.cmp(&a.nesting_depth)
-        }),
-        "lines_of_code" => functions.sort_by(|a, b| {
-            b.lines_of_code.cmp(&a.lines_of_code)
-        }),
-        _ => log::warn!("Unknown sort field: {}. Using churn_score.", sort_by),
-    }
-}
-
-fn calculate_summary(
-    functions: &[FunctionMetrics],
-    file_metrics: &HashMap<String, usize>,
-) -> SummaryStats {
-    let total_functions = functions.len();
-    let avg_complexity = if total_functions > 0 {
-        functions.iter().map(|f| f.cyclomatic_complexity as f64).sum::<f64>() / total_functions as f64
-    } else {
-        0.0
-    };
-
-    let total_churn = functions.iter().map(|f| f.churn_score).sum();
-
-    let mut most_churned: Vec<_> = file_metrics
-        .iter()
-        .map(|(file, churn)| (file.clone(), *churn))
-        .collect();
-    most_churned.sort_by(|a, b| b.1.cmp(&a.1));
-    let most_churned_files = most_churned.iter().take(10).map(|(f, _)| f.clone()).collect();
-
-    SummaryStats {
-        total_functions,
-        avg_complexity,
-        total_churn,
-        most_churned_files,
-    }
+    Ok(())
 }

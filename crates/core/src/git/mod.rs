@@ -1,8 +1,9 @@
 use crate::metrics::ChurnMetrics;
 use anyhow::Result;
-use git2::{Commit, Repository};
+use git2::{Commit, Repository, Oid};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use aho_corasick::AhoCorasick;
 
 pub struct GitAnalyzer;
 
@@ -18,11 +19,14 @@ impl GitAnalyzer {
         let mut revwalk = repo.revwalk()?;
         revwalk.push_head()?;
 
+        let patterns = &["fix", "bug", "issue", "close", "resolve"];
+        let ac = AhoCorasick::new(patterns).expect("Valid patterns");
+
         for oid in revwalk {
             let oid = oid?;
             let commit = repo.find_commit(oid)?;
             let author = commit.author().name().unwrap_or("Unknown").to_string();
-            let is_bug_fix = Self::is_bug_fix(&commit);
+            let is_bug_fix = Self::is_bug_fix(&commit, &ac);
 
             let modified_files = Self::get_modified_files(repo, &commit)?;
 
@@ -67,10 +71,20 @@ impl GitAnalyzer {
         Ok(result)
     }
 
-    fn is_bug_fix(commit: &Commit) -> bool {
+    pub fn get_file_oid(repo: &Repository, path: &Path) -> Result<Option<Oid>> {
+        let head = repo.head()?.peel_to_commit()?;
+        let tree = head.tree()?;
+        
+        match tree.get_path(path) {
+            Ok(entry) => Ok(Some(entry.id())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn is_bug_fix(commit: &Commit, ac: &AhoCorasick) -> bool {
         if let Some(message) = commit.message() {
             let lower_msg = message.to_lowercase();
-            lower_msg.contains("fix") || lower_msg.contains("bug")
+            ac.find(&lower_msg).is_some()
         } else {
             false
         }
@@ -94,21 +108,17 @@ impl GitAnalyzer {
                 }
             }
         } else {
-            // Initial commit: all files are "modified"
-            let mut tree_entries = Vec::new();
             tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
                 if let Some(name) = entry.name() {
                     let path = Path::new(root).join(name);
                     if let Some(path_str) = path.to_str() {
-                        tree_entries.push(path_str.to_string());
+                        files.push(path_str.to_string());
                     }
                 }
                 git2::TreeWalkResult::Ok
             })?;
-            files = tree_entries;
         }
 
-        // Deduplicate files if there are multiple parents (merges)
         files.sort();
         files.dedup();
         Ok(files)

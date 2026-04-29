@@ -48,7 +48,10 @@ fn main() -> Result<()> {
         r.store(true, Ordering::SeqCst);
     })?;
 
-    analyze_repository(&args.path, &args.sort, args.limit, shutdown)?;
+    let report = analyze_repository(&args.path, &args.sort, args.limit, shutdown)?;
+    if report.summary.total_functions > 0 {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use crate::cache::GitCacheEntry;
 use crate::metrics::ChurnMetrics;
 use aho_corasick::AhoCorasick;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use git2::{Commit, DiffOptions, Oid, Repository};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -30,7 +30,7 @@ impl GitAnalyzer {
         }
 
         let patterns = &["fix", "bug", "issue", "close", "resolve"];
-        let ac = AhoCorasick::new(patterns).expect("Valid patterns");
+        let ac = AhoCorasick::new(patterns)?;
 
         for oid in revwalk {
             let oid = oid?;
@@ -114,7 +114,9 @@ impl GitAnalyzer {
             if opt.is_none() {
                 *opt = Some(Repository::open(repo_path)?);
             }
-            let repo = opt.as_ref().unwrap();
+            let repo = opt
+                .as_ref()
+                .ok_or_else(|| anyhow!("Failed to initialize repository handle"))?;
 
             // Otimização: peel_to_commit uma única vez por HEAD
             let head = repo.head()?.peel_to_commit()?;

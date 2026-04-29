@@ -1,8 +1,9 @@
 use crate::metrics::FunctionMetrics;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC: &[u8; 4] = b"CHRN";
@@ -44,15 +45,19 @@ impl CacheManager {
         }
     }
 
-    pub fn load(&self) -> AnalysisCache {
-        if let Ok(data) = fs::read(&self.cache_path) {
-            if let Ok(versioned) = bincode::deserialize::<VersionedCache>(&data) {
-                if &versioned.magic == CACHE_MAGIC && versioned.version == CACHE_VERSION {
-                    return versioned.data;
-                }
-            }
+    pub fn load(&self) -> Result<AnalysisCache> {
+        let data = match fs::read(&self.cache_path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(AnalysisCache::default()),
+            Err(err) => return Err(err.into()),
+        };
+
+        let versioned = bincode::deserialize::<VersionedCache>(&data)?;
+        if &versioned.magic != CACHE_MAGIC || versioned.version != CACHE_VERSION {
+            return Err(anyhow!("Unsupported cache format"));
         }
-        AnalysisCache::default()
+
+        Ok(versioned.data)
     }
 
     pub fn save(&self, cache: AnalysisCache) -> Result<()> {

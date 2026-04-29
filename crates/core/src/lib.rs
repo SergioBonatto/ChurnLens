@@ -6,15 +6,23 @@ pub mod metrics;
 
 use anyhow::Result;
 use ast::parser::TypeScriptAnalyzer;
-use cache::CacheManager;
+use cache::{AnalysisCache, CacheManager};
+use chrono::Utc;
 use git::GitAnalyzer;
 use git2::Repository;
 use ignore::WalkBuilder;
-use metrics::{FunctionMetrics, Report, AnalysisMetadata, SummaryStats, MaxValues, Distributions, NormalizedMetrics, RiskMetrics, PercentileMetrics};
+use metrics::{
+    AnalysisMetadata, Distributions, FunctionMetrics, MaxValues, NormalizedMetrics,
+    PercentileMetrics, Report, RiskMetrics, SummaryStats,
+};
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use chrono::Utc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 const SCHEMA_VERSION: &str = "0.1.0";
 
@@ -23,7 +31,7 @@ pub fn analyze_repository(
     _sort_by: &str,
     _limit: Option<usize>,
     shutdown: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<Report> {
     log::info!("Analyzing repository: {}", repo_path.display());
 
     let repo = Repository::open(repo_path)?;
@@ -32,111 +40,158 @@ pub fn analyze_repository(
     let commit_hash = head.peel_to_commit()?.id().to_string();
 
     let cache_manager = CacheManager::new(repo_path);
-    let mut cache = cache_manager.load();
-    
+    let mut cache = match cache_manager.load() {
+        Ok(cache) => cache,
+        Err(err) => {
+            log::warn!("Failed to load cache: {}", err);
+            AnalysisCache::default()
+        }
+    };
+
     // Análise Incremental de Git preservando integridade de autores
     let git_cache = GitAnalyzer::get_all_file_metrics(
-        &repo, 
-        cache.git_cache.clone(), 
-        cache.last_commit_oid.clone()
+        &repo,
+        cache.git_cache.clone(),
+        cache.last_commit_oid.clone(),
     )?;
 
-    let new_cache_files = Arc::new(Mutex::new(HashMap::new()));
     let repo_path_abs = repo_path.canonicalize()?;
-    let all_functions = Arc::new(Mutex::new(Vec::new()));
 
     let walker = WalkBuilder::new(&repo_path_abs)
         .standard_filters(true)
         .hidden(false)
-        .build_parallel();
+        .build();
 
-    rayon::scope(|_| {
-        walker.run(|| {
-            let repo_path_abs = repo_path_abs.clone();
-            let git_cache = &git_cache;
-            let cache = &cache;
-            let new_cache_files = Arc::clone(&new_cache_files);
-            let all_functions = Arc::clone(&all_functions);
-            let shutdown = Arc::clone(&shutdown);
+    let (mut functions, new_cache_files) = walker
+        .par_bridge()
+        .filter_map(|entry| {
+            if shutdown.load(Ordering::Relaxed) {
+                return None;
+            }
 
-            Box::new(move |entry| {
-                if shutdown.load(Ordering::Relaxed) {
-                    return ignore::WalkState::Quit;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    log::warn!("Failed to read directory entry: {}", err);
+                    return None;
                 }
+            };
 
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => return ignore::WalkState::Continue,
-                };
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
 
-                let path = entry.path();
-                if !path.is_file() {
-                    return ignore::WalkState::Continue;
+            let ext = path.extension()?;
+            if ext != "ts" && ext != "tsx" && ext != "js" && ext != "jsx" {
+                return None;
+            }
+
+            let rel_path = path.strip_prefix(&repo_path_abs).ok()?;
+            let rel_path_str = rel_path.to_string_lossy().to_string();
+
+            let current_oid = match GitAnalyzer::get_file_oid_tls(&repo_path_abs, rel_path) {
+                Ok(Some(oid)) => oid.to_string(),
+                Ok(None) => String::new(),
+                Err(err) => {
+                    log::warn!("Failed to read Git object for {}: {}", rel_path_str, err);
+                    String::new()
                 }
+            };
 
-                if let Some(ext) = path.extension() {
-                    if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
-                        if let Ok(rel_path) = path.strip_prefix(&repo_path_abs) {
-                            let rel_path_str = rel_path.to_string_lossy().to_string();
-                            
-                            let current_oid = GitAnalyzer::get_file_oid_tls(&repo_path_abs, rel_path)
-                                .unwrap_or(None)
-                                .map(|o| o.to_string())
-                                .unwrap_or_default();
-
-                            let mut functions = if let Some((cached_oid, cached_funcs)) = cache.files.get(&rel_path_str) {
-                                if cached_oid == &current_oid && !current_oid.is_empty() {
-                                    cached_funcs.clone()
-                                } else {
-                                    AnalysisWorker::process_file(path, &rel_path_str)
-                                }
-                            } else {
-                                AnalysisWorker::process_file(path, &rel_path_str)
-                            };
-
-                            // Vincula métricas de churn do cache
-                            if let Some(entry) = git_cache.get(&rel_path_str) {
-                                let churn = GitAnalyzer::compute_churn_metrics(entry);
-                                for func in &mut functions {
-                                    func.times_modified = churn.times_modified;
-                                    func.bug_fix_commits = churn.bug_fix_commits;
-                                    func.authors_count = churn.authors_count;
-                                    func.churn_score = churn.churn_score;
-                                    func.file = rel_path_str.clone();
-                                }
-                            }
-
-                            // Coleta funções para análise global
-                            {
-                                let mut all = all_functions.lock().unwrap();
-                                all.extend(functions.clone());
-                            }
-
-                            // Atualiza cache de arquivos
-                            if !current_oid.is_empty() {
-                                let mut new_files = new_cache_files.lock().unwrap();
-                                new_files.insert(rel_path_str, (current_oid, functions));
+            let mut functions =
+                if let Some((cached_oid, cached_funcs)) = cache.files.get(&rel_path_str) {
+                    if cached_oid == &current_oid && !current_oid.is_empty() {
+                        cached_funcs.clone()
+                    } else {
+                        match AnalysisWorker::process_file(path, &rel_path_str) {
+                            Ok(functions) => functions,
+                            Err(err) => {
+                                log::warn!("Failed to analyze {}: {}", rel_path_str, err);
+                                Vec::new()
                             }
                         }
                     }
-                }
+                } else {
+                    match AnalysisWorker::process_file(path, &rel_path_str) {
+                        Ok(functions) => functions,
+                        Err(err) => {
+                            log::warn!("Failed to analyze {}: {}", rel_path_str, err);
+                            Vec::new()
+                        }
+                    }
+                };
 
-                ignore::WalkState::Continue
-            })
-        });
-    });
+            if let Some(entry) = git_cache.get(&rel_path_str) {
+                let churn = GitAnalyzer::compute_churn_metrics(entry);
+                for func in &mut functions {
+                    func.times_modified = churn.times_modified;
+                    func.bug_fix_commits = churn.bug_fix_commits;
+                    func.authors_count = churn.authors_count;
+                    func.churn_score = churn.churn_score;
+                    func.file = rel_path_str.clone();
+                }
+            }
+
+            let cache_entry = if current_oid.is_empty() {
+                None
+            } else {
+                Some((rel_path_str, (current_oid, functions.clone())))
+            };
+
+            Some((functions, cache_entry))
+        })
+        .fold(
+            || (Vec::new(), HashMap::new()),
+            |mut acc, (functions, cache_entry)| {
+                acc.0.extend(functions);
+                if let Some((path, entry)) = cache_entry {
+                    acc.1.insert(path, entry);
+                }
+                acc
+            },
+        )
+        .reduce(
+            || (Vec::new(), HashMap::new()),
+            |mut acc, (functions, cache_entries)| {
+                acc.0.extend(functions);
+                acc.1.extend(cache_entries);
+                acc
+            },
+        );
 
     // Análise Estatística Global
-    let mut functions = Arc::try_unwrap(all_functions).unwrap().into_inner().unwrap();
     if functions.is_empty() {
         log::warn!("No functions found to analyze.");
-        return Ok(());
+        return Ok(Report {
+            schema_version: SCHEMA_VERSION.to_string(),
+            analysis: AnalysisMetadata {
+                repository: repo_path_abs.to_string_lossy().to_string(),
+                commit: commit_hash,
+                branch: branch_name,
+                timestamp: Utc::now().to_rfc3339(),
+            },
+            summary: SummaryStats {
+                total_functions: 0,
+                max_values: None,
+                distributions: None,
+            },
+            functions,
+        });
     }
 
     // 1. Cálculo de Max e Distribuição Percentil
     let max_values = MaxValues {
-        cyclomatic: functions.iter().map(|f| f.cyclomatic_complexity).max().unwrap_or(1),
-        cognitive: functions.iter().map(|f| f.cognitive_complexity).max().unwrap_or(1),
+        cyclomatic: functions
+            .iter()
+            .map(|f| f.cyclomatic_complexity)
+            .max()
+            .unwrap_or(1),
+        cognitive: functions
+            .iter()
+            .map(|f| f.cognitive_complexity)
+            .max()
+            .unwrap_or(1),
         churn: functions.iter().map(|f| f.churn_score).fold(0.0, f64::max),
         loc: functions.iter().map(|f| f.lines_of_code).max().unwrap_or(1),
     };
@@ -148,7 +203,7 @@ pub fn analyze_repository(
     let mut auth_vals: Vec<usize> = functions.iter().map(|f| f.authors_count).collect();
 
     cog_vals.sort();
-    churn_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    churn_vals.sort_by(|a, b| a.total_cmp(b));
     loc_vals.sort();
     cyc_vals.sort();
     auth_vals.sort();
@@ -169,11 +224,36 @@ pub fn analyze_repository(
     let auth_p99 = auth_vals[p99_idx] as f64;
 
     // Normalização com proteção contra outliers
-    let cap_cog = if (max_values.cognitive as f64) > 3.0 * cognitive_p95 { cognitive_p99 } else { max_values.cognitive as f64 }.max(1.0);
-    let cap_churn = if max_values.churn > 3.0 * churn_p95 { churn_p99 } else { max_values.churn }.max(1.0);
-    let cap_loc = if (max_values.loc as f64) > 3.0 * loc_p95 { loc_p99 } else { max_values.loc as f64 }.max(1.0);
-    let cap_cyc = if (max_values.cyclomatic as f64) > 3.0 * cyc_p95 { cyc_p99 } else { max_values.cyclomatic as f64 }.max(1.0);
-    let cap_auth = if (auth_vals.iter().max().cloned().unwrap_or(0) as f64) > 3.0 * auth_p95 { auth_p99 } else { *auth_vals.iter().max().unwrap_or(&0) as f64 }.max(1.0);
+    let cap_cog = if (max_values.cognitive as f64) > 3.0 * cognitive_p95 {
+        cognitive_p99
+    } else {
+        max_values.cognitive as f64
+    }
+    .max(1.0);
+    let cap_churn = if max_values.churn > 3.0 * churn_p95 {
+        churn_p99
+    } else {
+        max_values.churn
+    }
+    .max(1.0);
+    let cap_loc = if (max_values.loc as f64) > 3.0 * loc_p95 {
+        loc_p99
+    } else {
+        max_values.loc as f64
+    }
+    .max(1.0);
+    let cap_cyc = if (max_values.cyclomatic as f64) > 3.0 * cyc_p95 {
+        cyc_p99
+    } else {
+        max_values.cyclomatic as f64
+    }
+    .max(1.0);
+    let cap_auth = if (auth_vals.iter().max().cloned().unwrap_or(0) as f64) > 3.0 * auth_p95 {
+        auth_p99
+    } else {
+        *auth_vals.iter().max().unwrap_or(&0) as f64
+    }
+    .max(1.0);
 
     // 2. Cálculo de scores de risco
     for func in &mut functions {
@@ -191,7 +271,11 @@ pub fn analyze_repository(
             authors: norm_auth,
         });
 
-        let base_score = (0.35 * norm_cog) + (0.15 * norm_cyc) + (0.30 * norm_churn) + (0.10 * norm_loc) + (0.10 * norm_auth);
+        let base_score = (0.35 * norm_cog)
+            + (0.15 * norm_cyc)
+            + (0.30 * norm_churn)
+            + (0.10 * norm_loc)
+            + (0.10 * norm_auth);
         let nesting_penalty = 1.0 + (func.nesting_depth as f64 / 4.0).powi(2) * 0.20;
         let final_score = base_score * nesting_penalty;
 
@@ -205,21 +289,26 @@ pub fn analyze_repository(
     }
 
     // 3. Cálculo de Rankings Percentis e Metadados de Risco
-    let mut risk_vals: Vec<f64> = functions.iter().map(|f| f.risk.as_ref().unwrap().final_score).collect();
-    risk_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut risk_vals: Vec<f64> = functions
+        .iter()
+        .filter_map(|f| f.risk.as_ref().map(|risk| risk.final_score))
+        .collect();
+    risk_vals.sort_by(|a, b| a.total_cmp(b));
 
     let total_funcs = functions.len() as f64;
     for func in &mut functions {
-        let risk_score = func.risk.as_ref().unwrap().final_score;
+        let Some(risk_score) = func.risk.as_ref().map(|risk| risk.final_score) else {
+            continue;
+        };
         let churn = func.churn_score;
         let cog = func.cognitive_complexity as f64;
 
-        let risk_pct = (risk_vals.iter().position(|&v| v >= risk_score).unwrap_or(0) as f64 / total_funcs) * 100.0;
-        
+        let risk_pct = percentile_f64(&risk_vals, risk_score, total_funcs);
+
         func.percentile = Some(PercentileMetrics {
             risk: risk_pct,
-            churn: (churn_vals.iter().position(|&v| v >= churn).unwrap_or(0) as f64 / total_funcs) * 100.0,
-            cognitive: (cog_vals.iter().position(|&v| v >= cog as u32).unwrap_or(0) as f64 / total_funcs) * 100.0,
+            churn: percentile_f64(&churn_vals, churn, total_funcs),
+            cognitive: percentile_u32(&cog_vals, cog as u32, total_funcs),
         });
 
         let level = match risk_pct {
@@ -227,7 +316,8 @@ pub fn analyze_repository(
             p if p > 80.0 => "high",
             p if p > 50.0 => "medium",
             _ => "low",
-        }.to_string();
+        }
+        .to_string();
 
         if let Some(norm) = &func.normalized {
             let mut drivers = vec![
@@ -237,15 +327,17 @@ pub fn analyze_repository(
                 ("loc", norm.loc),
                 ("authors", norm.authors),
             ];
-            drivers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            func.risk.as_mut().unwrap().level = level;
-            func.risk.as_mut().unwrap().primary_driver = drivers[0].0.to_string();
+            drivers.sort_by(|a, b| b.1.total_cmp(&a.1));
+            if let Some(risk) = func.risk.as_mut() {
+                risk.level = level;
+                risk.primary_driver = drivers[0].0.to_string();
+            }
         }
     }
 
     // Geração do Report Final
     let risk_p95 = risk_vals[p95_idx];
-    
+
     let report = Report {
         schema_version: SCHEMA_VERSION.to_string(),
         analysis: AnalysisMetadata {
@@ -266,28 +358,47 @@ pub fn analyze_repository(
         functions,
     };
 
-    if let Ok(json) = serde_json::to_string_pretty(&report) {
-        println!("{}", json);
-    }
-
     // Finaliza cache com integridade Git total
-    let new_files = Arc::try_unwrap(new_cache_files).unwrap().into_inner().unwrap();
-    cache.files = new_files;
+    cache.files = new_cache_files;
     cache.git_cache = git_cache;
     cache.last_commit_oid = Some(commit_hash);
-    let _ = cache_manager.save(cache);
+    if let Err(err) = cache_manager.save(cache) {
+        log::warn!("Failed to save cache: {}", err);
+    }
 
-    Ok(())
+    Ok(report)
+}
+
+fn percentile_f64(sorted_values: &[f64], value: f64, total: f64) -> f64 {
+    let idx = match sorted_values.binary_search_by(|probe| {
+        if probe.total_cmp(&value) == CmpOrdering::Less {
+            CmpOrdering::Less
+        } else {
+            CmpOrdering::Greater
+        }
+    }) {
+        Ok(idx) | Err(idx) => idx,
+    };
+    (idx as f64 / total) * 100.0
+}
+
+fn percentile_u32(sorted_values: &[u32], value: u32, total: f64) -> f64 {
+    let idx = match sorted_values.binary_search_by(|probe| {
+        if *probe < value {
+            CmpOrdering::Less
+        } else {
+            CmpOrdering::Greater
+        }
+    }) {
+        Ok(idx) | Err(idx) => idx,
+    };
+    (idx as f64 / total) * 100.0
 }
 
 struct AnalysisWorker;
 impl AnalysisWorker {
-    fn process_file(path: &Path, rel_path_str: &str) -> Vec<FunctionMetrics> {
-        if let Ok(source) = std::fs::read_to_string(path) {
-            if let Ok(funcs) = TypeScriptAnalyzer::analyze_source(&source, rel_path_str) {
-                return funcs;
-            }
-        }
-        Vec::new()
+    fn process_file(path: &Path, rel_path_str: &str) -> Result<Vec<FunctionMetrics>> {
+        let source = std::fs::read_to_string(path)?;
+        TypeScriptAnalyzer::analyze_source(&source, rel_path_str)
     }
 }

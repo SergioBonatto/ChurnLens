@@ -3,11 +3,14 @@ use crate::metrics::ChurnMetrics;
 use aho_corasick::AhoCorasick;
 use anyhow::{anyhow, Result};
 use git2::{Commit, DiffOptions, Oid, Repository};
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub struct GitAnalyzer;
+
+const COMMITS_PER_WORKER_CHUNK: usize = 32;
 
 thread_local! {
     static REPO_HANDLE: RefCell<Option<Repository>> = const { RefCell::new(None) };
@@ -29,28 +32,19 @@ impl GitAnalyzer {
             }
         }
 
+        let commits: Vec<Oid> = revwalk.collect::<std::result::Result<Vec<_>, _>>()?;
+        let repo_path = repo.path().to_path_buf();
         let patterns = &["fix", "bug", "issue", "close", "resolve"];
         let ac = AhoCorasick::new(patterns)?;
+        let new_metrics = commits
+            .par_chunks(COMMITS_PER_WORKER_CHUNK)
+            .map(|oids| Self::process_commit_chunk(&repo_path, oids, &ac))
+            .reduce(HashMap::new, |mut acc, metrics| {
+                Self::merge_git_cache(&mut acc, metrics);
+                acc
+            });
 
-        for oid in revwalk {
-            let oid = oid?;
-            let commit = repo.find_commit(oid)?;
-            let author = commit.author().name().unwrap_or("Unknown").to_string();
-            let is_bug_fix = Self::is_bug_fix(&commit, &ac);
-
-            // ANALISE DE MERGE: Para métricas de churn, comparamos com o primeiro pai (mainline)
-            // para evitar dupla contagem de modificações vindas de branches laterais.
-            let modified_files = Self::get_modified_files_optimized(repo, &commit)?;
-
-            for file_path in modified_files {
-                let entry = git_cache.entry(file_path).or_default();
-                entry.times_modified += 1;
-                if is_bug_fix {
-                    entry.bug_fix_commits += 1;
-                }
-                entry.authors.insert(author.clone());
-            }
-        }
+        Self::merge_git_cache(&mut git_cache, new_metrics);
 
         Ok(git_cache)
     }
@@ -106,6 +100,65 @@ impl GitAnalyzer {
         }
 
         Ok(files)
+    }
+
+    fn process_commit_chunk(
+        repo_path: &Path,
+        oids: &[Oid],
+        ac: &AhoCorasick,
+    ) -> HashMap<String, GitCacheEntry> {
+        let repo = match Repository::open(repo_path) {
+            Ok(repo) => repo,
+            Err(err) => {
+                log::warn!("Failed to open repository {}: {}", repo_path.display(), err);
+                return HashMap::new();
+            }
+        };
+
+        let mut metrics = HashMap::new();
+        for oid in oids {
+            match Self::process_commit(&repo, *oid, ac) {
+                Ok(commit_metrics) => Self::merge_git_cache(&mut metrics, commit_metrics),
+                Err(err) => log::warn!("Failed to process commit {}: {}", oid, err),
+            }
+        }
+
+        metrics
+    }
+
+    fn process_commit(
+        repo: &Repository,
+        oid: Oid,
+        ac: &AhoCorasick,
+    ) -> Result<HashMap<String, GitCacheEntry>> {
+        let commit = repo.find_commit(oid)?;
+        let author = commit.author().name().unwrap_or("Unknown").to_string();
+        let is_bug_fix = Self::is_bug_fix(&commit, ac);
+        let modified_files = Self::get_modified_files_optimized(repo, &commit)?;
+
+        let mut metrics = HashMap::new();
+        for file_path in modified_files {
+            let entry: &mut GitCacheEntry = metrics.entry(file_path).or_default();
+            entry.times_modified += 1;
+            if is_bug_fix {
+                entry.bug_fix_commits += 1;
+            }
+            entry.authors.insert(author.clone());
+        }
+
+        Ok(metrics)
+    }
+
+    fn merge_git_cache(
+        target: &mut HashMap<String, GitCacheEntry>,
+        source: HashMap<String, GitCacheEntry>,
+    ) {
+        for (file_path, source_entry) in source {
+            let target_entry = target.entry(file_path).or_default();
+            target_entry.times_modified += source_entry.times_modified;
+            target_entry.bug_fix_commits += source_entry.bug_fix_commits;
+            target_entry.authors.extend(source_entry.authors);
+        }
     }
 
     pub fn get_file_oid_tls(repo_path: &Path, rel_path: &Path) -> Result<Option<Oid>> {

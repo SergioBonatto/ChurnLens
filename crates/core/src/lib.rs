@@ -6,39 +6,48 @@ pub mod metrics;
 
 use anyhow::Result;
 use ast::parser::TypeScriptAnalyzer;
-use cache::{AnalysisCache, CacheManager};
+use cache::{AnalysisCache, CacheManager, FileCacheEntry};
 use chrono::{DateTime, Utc};
 use git::GitAnalyzer;
 use git2::Repository;
 use ignore::WalkBuilder;
 use metrics::{
-    AnalysisMetadata, Distributions, FunctionMetrics, MaxValues, NormalizedMetrics,
-    PercentileMetrics, Report, RiskMetrics, SummaryStats,
+    AnalysisMetadata, AnalysisQuality, AnalysisStatus, AnalysisWarning, CacheAnalysisStatus,
+    Distributions, FunctionMetrics, GitAnalysisStatus, MaxValues, NormalizedMetrics,
+    PercentileMetrics, Report, RiskMetrics, SkippedFile, SummaryStats,
 };
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 
-const SCHEMA_VERSION: &str = "0.1.0";
+const SCHEMA_VERSION: &str = "0.2.0";
 const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
 
 pub fn analyze_repository(
     repo_path: &Path,
-    _sort_by: &str,
-    _limit: Option<usize>,
+    sort_by: &str,
+    limit: Option<usize>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<Report> {
     log::info!("Analyzing repository: {}", repo_path.display());
 
-    let repo = match Repository::open(repo_path) {
+    // Canonicalize the repository root once so Git, cache, and filesystem reads share the same path.
+    let repo_path_abs = repo_path.canonicalize()?;
+    let mut warnings = Vec::new();
+    let mut skipped_files = Vec::new();
+
+    let repo = match Repository::open(&repo_path_abs) {
         Ok(repo) => Some(repo),
         Err(err) => {
-            log::warn!("Git repository unavailable: {}", err);
+            warnings.push(AnalysisWarning {
+                code: "git_unavailable".to_string(),
+                message: format!("Git repository unavailable: {err}"),
+            });
             None
         }
     };
@@ -51,40 +60,86 @@ pub fn analyze_repository(
         ),
     };
 
-    let cache_manager = CacheManager::new(repo_path);
-    let mut cache = match cache_manager.load() {
-        Ok(cache) => cache,
+    let cache_manager = match CacheManager::new(&repo_path_abs) {
+        Ok(cache_manager) => Some(cache_manager),
         Err(err) => {
-            log::warn!("Failed to load cache: {}", err);
-            AnalysisCache::default()
+            warnings.push(AnalysisWarning {
+                code: "cache_unavailable".to_string(),
+                message: format!("Failed to initialize cache: {err}"),
+            });
+            None
         }
     };
+    // Load the local cache if it exists. Any failure is recorded as partial analysis metadata.
+    let mut cache = if let Some(cache_manager) = &cache_manager {
+        match cache_manager.load() {
+            Ok(cache) => cache,
+            Err(err) => {
+                warnings.push(AnalysisWarning {
+                    code: "cache_load_failed".to_string(),
+                    message: format!("Failed to load cache: {err}"),
+                });
+                AnalysisCache::default()
+            }
+        }
+    } else {
+        AnalysisCache::default()
+    };
+    let cache_loaded = cache_manager.is_some()
+        && (!cache.files.is_empty()
+            || !cache.git_cache.is_empty()
+            || cache.last_commit_oid.is_some());
 
-    // Análise Incremental de Git preservando integridade de autores
-    let git_cache = match repo.as_ref() {
+    // Collect Git churn first so file-level metrics can be enriched before normalization and scoring.
+    let mut git_status = GitAnalysisStatus {
+        available: repo.is_some(),
+        partial: false,
+        cache_reset: false,
+        processed_commits: 0,
+    };
+
+    let mut git_cache = match repo.as_ref() {
         Some(repo) => match GitAnalyzer::get_all_file_metrics(
             repo,
-            cache.git_cache.clone(),
+            std::mem::take(&mut cache.git_cache),
+            cache.git_metadata.clone(),
             cache.last_commit_oid.clone(),
+            &repo_path_abs,
+            &branch_name,
+            &commit_hash,
         ) {
-            Ok(git_cache) => git_cache,
+            Ok(git_result) => {
+                git_status.partial = git_result.partial;
+                git_status.cache_reset = git_result.cache_reset;
+                git_status.processed_commits = git_result.processed_commits;
+                for warning in git_result.warnings {
+                    warnings.push(AnalysisWarning {
+                        code: "git_partial".to_string(),
+                        message: warning,
+                    });
+                }
+                cache.git_metadata = Some(git_result.metadata);
+                git_result.cache
+            }
             Err(err) => {
-                log::warn!("Failed to collect Git metrics: {}", err);
+                git_status.partial = true;
+                warnings.push(AnalysisWarning {
+                    code: "git_metrics_failed".to_string(),
+                    message: format!("Failed to collect Git metrics: {err}"),
+                });
                 HashMap::new()
             }
         },
         None => HashMap::new(),
     };
 
-    let repo_path_abs = repo_path.canonicalize()?;
-    let repo_available = repo.is_some();
-
     let walker = WalkBuilder::new(&repo_path_abs)
         .standard_filters(true)
         .hidden(false)
         .build();
 
-    let (mut functions, new_cache_files) = walker
+    // Walk the working tree, reuse AST cache entries when the content hash matches, and collect per-file results.
+    let worker_result = walker
         .par_bridge()
         .filter_map(|entry| {
             if shutdown.load(Ordering::Relaxed) {
@@ -94,8 +149,13 @@ pub fn analyze_repository(
             let entry = match entry {
                 Ok(e) => e,
                 Err(err) => {
-                    log::warn!("Failed to read directory entry: {}", err);
-                    return None;
+                    return Some(WorkerOutput {
+                        warnings: vec![AnalysisWarning {
+                            code: "walk_entry_failed".to_string(),
+                            message: format!("Failed to read directory entry: {err}"),
+                        }],
+                        ..WorkerOutput::default()
+                    });
                 }
             };
 
@@ -111,42 +171,53 @@ pub fn analyze_repository(
 
             let rel_path = path.strip_prefix(&repo_path_abs).ok()?;
             let rel_path_str = rel_path.to_string_lossy().to_string();
+            let mut output = WorkerOutput {
+                active_path: Some(rel_path_str.clone()),
+                ..WorkerOutput::default()
+            };
 
-            let current_oid = if repo_available {
-                match GitAnalyzer::get_file_oid_tls(&repo_path_abs, rel_path) {
-                    Ok(Some(oid)) => oid.to_string(),
-                    Ok(None) => String::new(),
-                    Err(err) => {
-                        log::warn!("Failed to read Git object for {}: {}", rel_path_str, err);
-                        String::new()
+            let source = match std::fs::read(path) {
+                Ok(source) => source,
+                Err(err) => {
+                    output.skipped_files.push(SkippedFile {
+                        path: rel_path_str,
+                        reason: format!("failed to read file: {err}"),
+                    });
+                    return Some(output);
+                }
+            };
+            let content_hash = stable_content_hash(&source);
+
+            let mut functions = if let Some(cached_entry) = cache.files.get(&rel_path_str) {
+                if cached_entry.content_hash == content_hash {
+                    output.cache_hit = 1;
+                    cached_entry.functions.clone()
+                } else {
+                    output.cache_miss = 1;
+                    match AnalysisWorker::process_file_from_source(&source, &rel_path_str) {
+                        Ok(functions) => functions,
+                        Err(err) => {
+                            output.skipped_files.push(SkippedFile {
+                                path: rel_path_str,
+                                reason: format!("failed to analyze file: {err}"),
+                            });
+                            return Some(output);
+                        }
                     }
                 }
             } else {
-                String::new()
+                output.cache_miss = 1;
+                match AnalysisWorker::process_file_from_source(&source, &rel_path_str) {
+                    Ok(functions) => functions,
+                    Err(err) => {
+                        output.skipped_files.push(SkippedFile {
+                            path: rel_path_str,
+                            reason: format!("failed to analyze file: {err}"),
+                        });
+                        return Some(output);
+                    }
+                }
             };
-
-            let mut functions =
-                if let Some((cached_oid, cached_funcs)) = cache.files.get(&rel_path_str) {
-                    if cached_oid == &current_oid && !current_oid.is_empty() {
-                        cached_funcs.clone()
-                    } else {
-                        match AnalysisWorker::process_file(path, &rel_path_str) {
-                            Ok(functions) => functions,
-                            Err(err) => {
-                                log::warn!("Failed to analyze {}: {}", rel_path_str, err);
-                                Vec::new()
-                            }
-                        }
-                    }
-                } else {
-                    match AnalysisWorker::process_file(path, &rel_path_str) {
-                        Ok(functions) => functions,
-                        Err(err) => {
-                            log::warn!("Failed to analyze {}: {}", rel_path_str, err);
-                            Vec::new()
-                        }
-                    }
-                };
 
             if let Some(entry) = git_cache.get(&rel_path_str) {
                 let churn = GitAnalyzer::compute_churn_metrics(entry);
@@ -159,36 +230,62 @@ pub fn analyze_repository(
                 }
             }
 
-            let cache_entry = if current_oid.is_empty() {
-                None
-            } else {
-                Some((rel_path_str, (current_oid, functions.clone())))
-            };
+            output.cache_entry = Some((
+                rel_path_str,
+                FileCacheEntry {
+                    content_hash,
+                    functions: functions.clone(),
+                },
+            ));
+            output.functions = functions;
 
-            Some((functions, cache_entry))
+            Some(output)
         })
-        .fold(
-            || (Vec::new(), HashMap::new()),
-            |mut acc, (functions, cache_entry)| {
-                acc.0.extend(functions);
-                if let Some((path, entry)) = cache_entry {
-                    acc.1.insert(path, entry);
-                }
-                acc
-            },
-        )
-        .reduce(
-            || (Vec::new(), HashMap::new()),
-            |mut acc, (functions, cache_entries)| {
-                acc.0.extend(functions);
-                acc.1.extend(cache_entries);
-                acc
-            },
-        );
+        .fold(WorkerAccumulator::default, |mut acc, output| {
+            acc.functions.extend(output.functions);
+            if let Some((path, entry)) = output.cache_entry {
+                acc.cache_entries.insert(path, entry);
+            }
+            if let Some(path) = output.active_path {
+                acc.active_paths.insert(path);
+            }
+            acc.cache_hits += output.cache_hit;
+            acc.cache_misses += output.cache_miss;
+            acc.warnings.extend(output.warnings);
+            acc.skipped_files.extend(output.skipped_files);
+            acc
+        })
+        .reduce(WorkerAccumulator::default, |mut acc, output| {
+            acc.functions.extend(output.functions);
+            acc.cache_entries.extend(output.cache_entries);
+            acc.active_paths.extend(output.active_paths);
+            acc.cache_hits += output.cache_hits;
+            acc.cache_misses += output.cache_misses;
+            acc.warnings.extend(output.warnings);
+            acc.skipped_files.extend(output.skipped_files);
+            acc
+        })
+        .into_parts();
 
-    // Análise Estatística Global
+    let mut functions = worker_result.functions;
+    warnings.extend(worker_result.warnings);
+    skipped_files.extend(worker_result.skipped_files);
+    git_cache.retain(|path, _| worker_result.active_paths.contains(path));
+
     if functions.is_empty() {
-        log::warn!("No functions found to analyze.");
+        warnings.push(AnalysisWarning {
+            code: "no_functions_found".to_string(),
+            message: "No functions found to analyze.".to_string(),
+        });
+        let quality = build_quality(
+            git_status,
+            cache_manager.is_some(),
+            cache_loaded,
+            false,
+            worker_result.cache_stats,
+            warnings,
+            skipped_files,
+        );
         return Ok(Report {
             schema_version: SCHEMA_VERSION.to_string(),
             analysis: AnalysisMetadata {
@@ -202,11 +299,12 @@ pub fn analyze_repository(
                 max_values: None,
                 distributions: None,
             },
+            quality,
             functions,
         });
     }
 
-    // 1. Cálculo de Max e Distribuição Percentil
+    // Compute repository-wide caps before deriving normalized metrics and risk scores.
     let max_values = MaxValues {
         cyclomatic: functions
             .iter()
@@ -249,7 +347,6 @@ pub fn analyze_repository(
     let cyc_p99 = cyc_vals[p99_idx] as f64;
     let auth_p99 = auth_vals[p99_idx] as f64;
 
-    // Normalização com proteção contra outliers
     let cap_cog = if (max_values.cognitive as f64) > 3.0 * cognitive_p95 {
         cognitive_p99
     } else {
@@ -281,13 +378,13 @@ pub fn analyze_repository(
     }
     .max(1.0);
 
-    // 2. Cálculo de scores de risco
+    // Normalize metrics, then derive the composite risk score for each function.
     for func in &mut functions {
-        let norm_cog = (1.0 + func.cognitive_complexity as f64).ln() / (1.0 + cap_cog).ln();
-        let norm_cyc = (1.0 + func.cyclomatic_complexity as f64).ln() / (1.0 + cap_cyc).ln();
-        let norm_churn = (1.0 + func.churn_score).ln() / (1.0 + cap_churn).ln();
-        let norm_loc = (1.0 + func.lines_of_code as f64).ln() / (1.0 + cap_loc).ln();
-        let norm_auth = (1.0 + func.authors_count as f64).ln() / (1.0 + cap_auth).ln();
+        let norm_cog = normalized_value(func.cognitive_complexity as f64, cap_cog);
+        let norm_cyc = normalized_value(func.cyclomatic_complexity as f64, cap_cyc);
+        let norm_churn = normalized_value(func.churn_score, cap_churn);
+        let norm_loc = normalized_value(func.lines_of_code as f64, cap_loc);
+        let norm_auth = normalized_value(func.authors_count as f64, cap_auth);
 
         func.normalized = Some(NormalizedMetrics {
             cyclomatic: norm_cyc,
@@ -314,7 +411,6 @@ pub fn analyze_repository(
         });
     }
 
-    // 3. Cálculo de Rankings Percentis e Metadados de Risco
     let mut risk_vals: Vec<f64> = functions
         .iter()
         .filter_map(|f| f.risk.as_ref().map(|risk| risk.final_score))
@@ -322,6 +418,7 @@ pub fn analyze_repository(
     risk_vals.sort_by(|a, b| a.total_cmp(b));
 
     let total_funcs = functions.len() as f64;
+    // Assign percentile ranks and human-readable risk labels.
     for func in &mut functions {
         let Some(risk_score) = func.risk.as_ref().map(|risk| risk.final_score) else {
             continue;
@@ -338,15 +435,15 @@ pub fn analyze_repository(
         });
 
         let level = match risk_pct {
-            p if p > 95.0 => "critical",
-            p if p > 80.0 => "high",
-            p if p > 50.0 => "medium",
+            p if p >= 95.0 => "critical",
+            p if p >= 80.0 => "high",
+            p if p >= 50.0 => "medium",
             _ => "low",
         }
         .to_string();
 
         if let Some(norm) = &func.normalized {
-            let mut drivers = vec![
+            let mut drivers = [
                 ("cognitive", norm.cognitive),
                 ("churn", norm.churn),
                 ("cyclomatic", norm.cyclomatic),
@@ -361,15 +458,41 @@ pub fn analyze_repository(
         }
     }
 
-    // Geração do Report Final
     let risk_p95 = risk_vals[p95_idx];
 
-    functions.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then(a.name.cmp(&b.name))
-            .then(a.line.cmp(&b.line))
-    });
+    // Apply user-facing ordering and optional truncation before emitting the report.
+    sort_functions(&mut functions, sort_by, &mut warnings);
+    if let Some(limit) = limit {
+        functions.truncate(limit);
+    }
+
+    let mut cache_saved = false;
+    cache.files = worker_result.cache_entries;
+    cache.git_cache = git_cache;
+    cache.last_commit_oid = if commit_hash.is_empty() {
+        None
+    } else {
+        Some(commit_hash.clone())
+    };
+    if let Some(cache_manager) = &cache_manager {
+        match cache_manager.save(cache) {
+            Ok(()) => cache_saved = true,
+            Err(err) => warnings.push(AnalysisWarning {
+                code: "cache_save_failed".to_string(),
+                message: format!("Failed to save cache: {err}"),
+            }),
+        }
+    }
+
+    let quality = build_quality(
+        git_status,
+        cache_manager.is_some(),
+        cache_loaded,
+        cache_saved,
+        worker_result.cache_stats,
+        warnings,
+        skipped_files,
+    );
 
     let report = Report {
         schema_version: SCHEMA_VERSION.to_string(),
@@ -388,20 +511,9 @@ pub fn analyze_repository(
                 cognitive_p95,
             }),
         },
+        quality,
         functions,
     };
-
-    // Finaliza cache com integridade Git total
-    cache.files = new_cache_files;
-    cache.git_cache = git_cache;
-    cache.last_commit_oid = if commit_hash.is_empty() {
-        None
-    } else {
-        Some(commit_hash)
-    };
-    if let Err(err) = cache_manager.save(cache) {
-        log::warn!("Failed to save cache: {}", err);
-    }
 
     Ok(report)
 }
@@ -437,6 +549,10 @@ fn commit_timestamp(commit: &git2::Commit) -> Option<String> {
 }
 
 fn percentile_f64(sorted_values: &[f64], value: f64, total: f64) -> f64 {
+    if sorted_values.len() <= 1 {
+        return 100.0;
+    }
+
     let idx = match sorted_values.binary_search_by(|probe| {
         if probe.total_cmp(&value) == CmpOrdering::Less {
             CmpOrdering::Less
@@ -446,10 +562,14 @@ fn percentile_f64(sorted_values: &[f64], value: f64, total: f64) -> f64 {
     }) {
         Ok(idx) | Err(idx) => idx,
     };
-    (idx as f64 / total) * 100.0
+    (idx as f64 / (total - 1.0)) * 100.0
 }
 
 fn percentile_u32(sorted_values: &[u32], value: u32, total: f64) -> f64 {
+    if sorted_values.len() <= 1 {
+        return 100.0;
+    }
+
     let idx = match sorted_values.binary_search_by(|probe| {
         if *probe < value {
             CmpOrdering::Less
@@ -459,13 +579,170 @@ fn percentile_u32(sorted_values: &[u32], value: u32, total: f64) -> f64 {
     }) {
         Ok(idx) | Err(idx) => idx,
     };
-    (idx as f64 / total) * 100.0
+    (idx as f64 / (total - 1.0)) * 100.0
+}
+
+fn normalized_value(value: f64, cap: f64) -> f64 {
+    ((1.0 + value).ln() / (1.0 + cap).ln()).min(1.0)
+}
+
+fn stable_content_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn sort_functions(
+    functions: &mut [FunctionMetrics],
+    sort_by: &str,
+    warnings: &mut Vec<AnalysisWarning>,
+) {
+    match sort_by {
+        "file" | "location" => sort_by_location(functions),
+        "churn_score" | "churn" => functions.sort_by(|a, b| {
+            b.churn_score
+                .total_cmp(&a.churn_score)
+                .then_with(|| location_order(a, b))
+        }),
+        "risk" | "risk_score" => functions.sort_by(|a, b| {
+            risk_score(b)
+                .total_cmp(&risk_score(a))
+                .then_with(|| location_order(a, b))
+        }),
+        "cognitive" | "cognitive_complexity" => functions.sort_by(|a, b| {
+            b.cognitive_complexity
+                .cmp(&a.cognitive_complexity)
+                .then_with(|| location_order(a, b))
+        }),
+        "cyclomatic" | "cyclomatic_complexity" => functions.sort_by(|a, b| {
+            b.cyclomatic_complexity
+                .cmp(&a.cyclomatic_complexity)
+                .then_with(|| location_order(a, b))
+        }),
+        "loc" | "lines_of_code" => functions.sort_by(|a, b| {
+            b.lines_of_code
+                .cmp(&a.lines_of_code)
+                .then_with(|| location_order(a, b))
+        }),
+        other => {
+            warnings.push(AnalysisWarning {
+                code: "unsupported_sort".to_string(),
+                message: format!("Unsupported sort field '{other}'. Falling back to file order."),
+            });
+            sort_by_location(functions);
+        }
+    }
+}
+
+fn sort_by_location(functions: &mut [FunctionMetrics]) {
+    functions.sort_by(location_order);
+}
+
+fn location_order(a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
+    a.file
+        .cmp(&b.file)
+        .then(a.name.cmp(&b.name))
+        .then(a.line.cmp(&b.line))
+}
+
+fn risk_score(function: &FunctionMetrics) -> f64 {
+    function
+        .risk
+        .as_ref()
+        .map(|risk| risk.final_score)
+        .unwrap_or(0.0)
+}
+
+fn build_quality(
+    git: GitAnalysisStatus,
+    cache_enabled: bool,
+    cache_loaded: bool,
+    cache_saved: bool,
+    cache_stats: CacheStats,
+    warnings: Vec<AnalysisWarning>,
+    skipped_files: Vec<SkippedFile>,
+) -> AnalysisQuality {
+    let status = if warnings.is_empty() && skipped_files.is_empty() && !git.partial {
+        AnalysisStatus::Complete
+    } else {
+        AnalysisStatus::Partial
+    };
+
+    AnalysisQuality {
+        status,
+        git,
+        cache: CacheAnalysisStatus {
+            enabled: cache_enabled,
+            loaded: cache_loaded,
+            saved: cache_saved,
+            ast_hits: cache_stats.hits,
+            ast_misses: cache_stats.misses,
+        },
+        warnings,
+        skipped_files,
+    }
+}
+
+#[derive(Default)]
+struct CacheStats {
+    hits: usize,
+    misses: usize,
+}
+
+#[derive(Default)]
+struct WorkerOutput {
+    functions: Vec<FunctionMetrics>,
+    cache_entry: Option<(String, FileCacheEntry)>,
+    active_path: Option<String>,
+    cache_hit: usize,
+    cache_miss: usize,
+    warnings: Vec<AnalysisWarning>,
+    skipped_files: Vec<SkippedFile>,
+}
+
+#[derive(Default)]
+struct WorkerAccumulator {
+    functions: Vec<FunctionMetrics>,
+    cache_entries: HashMap<String, FileCacheEntry>,
+    active_paths: HashSet<String>,
+    cache_hits: usize,
+    cache_misses: usize,
+    warnings: Vec<AnalysisWarning>,
+    skipped_files: Vec<SkippedFile>,
+}
+
+struct WorkerResult {
+    functions: Vec<FunctionMetrics>,
+    cache_entries: HashMap<String, FileCacheEntry>,
+    active_paths: HashSet<String>,
+    cache_stats: CacheStats,
+    warnings: Vec<AnalysisWarning>,
+    skipped_files: Vec<SkippedFile>,
+}
+
+impl WorkerAccumulator {
+    fn into_parts(self) -> WorkerResult {
+        WorkerResult {
+            functions: self.functions,
+            cache_entries: self.cache_entries,
+            active_paths: self.active_paths,
+            cache_stats: CacheStats {
+                hits: self.cache_hits,
+                misses: self.cache_misses,
+            },
+            warnings: self.warnings,
+            skipped_files: self.skipped_files,
+        }
+    }
 }
 
 struct AnalysisWorker;
 impl AnalysisWorker {
-    fn process_file(path: &Path, rel_path_str: &str) -> Result<Vec<FunctionMetrics>> {
-        let source = std::fs::read_to_string(path)?;
-        TypeScriptAnalyzer::analyze_source(&source, rel_path_str)
+    fn process_file_from_source(source: &[u8], rel_path_str: &str) -> Result<Vec<FunctionMetrics>> {
+        let source = std::str::from_utf8(source)?;
+        TypeScriptAnalyzer::analyze_source(source, rel_path_str)
     }
 }

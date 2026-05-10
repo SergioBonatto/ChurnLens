@@ -7,13 +7,21 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC: &[u8; 4] = b"CHRN";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
+pub const GIT_ALGORITHM_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct AnalysisCache {
-    pub files: HashMap<String, (String, Vec<FunctionMetrics>)>,
+    pub files: HashMap<String, FileCacheEntry>,
     pub git_cache: HashMap<String, GitCacheEntry>,
     pub last_commit_oid: Option<String>,
+    pub git_metadata: Option<GitCacheMetadata>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct FileCacheEntry {
+    pub content_hash: String,
+    pub functions: Vec<FunctionMetrics>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -21,6 +29,14 @@ pub struct GitCacheEntry {
     pub times_modified: usize,
     pub bug_fix_commits: usize,
     pub authors: HashSet<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GitCacheMetadata {
+    pub repository_path: String,
+    pub branch: String,
+    pub head_oid: String,
+    pub algorithm_version: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -35,14 +51,12 @@ pub struct CacheManager {
 }
 
 impl CacheManager {
-    pub fn new(repo_path: &Path) -> Self {
+    pub fn new(repo_path: &Path) -> Result<Self> {
         let cache_dir = repo_path.join(".churnlens");
-        if !cache_dir.exists() {
-            let _ = fs::create_dir_all(&cache_dir);
-        }
-        Self {
+        fs::create_dir_all(&cache_dir)?;
+        Ok(Self {
             cache_path: cache_dir.join("cache.bin"),
-        }
+        })
     }
 
     pub fn load(&self) -> Result<AnalysisCache> {

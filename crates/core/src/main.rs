@@ -13,11 +13,11 @@ struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Sort by field (deprecated for streaming mode)
-    #[arg(short, long, default_value = "churn_score")]
+    /// Sort by field: file, risk, churn_score, cognitive, cyclomatic, loc
+    #[arg(short, long, default_value = "file")]
     sort: String,
 
-    /// Limit number of results (deprecated for streaming mode)
+    /// Limit number of functions in the report
     #[arg(short, long)]
     limit: Option<usize>,
 

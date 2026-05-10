@@ -49,6 +49,7 @@ pub struct Report {
     pub schema_version: String,
     pub analysis: AnalysisMetadata,
     pub summary: SummaryStats,
+    pub quality: AnalysisQuality,
     pub functions: Vec<FunctionMetrics>,
 }
 
@@ -58,6 +59,51 @@ pub struct AnalysisMetadata {
     pub commit: String,
     pub branch: String,
     pub timestamp: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AnalysisQuality {
+    pub status: AnalysisStatus,
+    pub git: GitAnalysisStatus,
+    pub cache: CacheAnalysisStatus,
+    pub warnings: Vec<AnalysisWarning>,
+    pub skipped_files: Vec<SkippedFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisStatus {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitAnalysisStatus {
+    pub available: bool,
+    pub partial: bool,
+    pub cache_reset: bool,
+    pub processed_commits: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheAnalysisStatus {
+    pub enabled: bool,
+    pub loaded: bool,
+    pub saved: bool,
+    pub ast_hits: usize,
+    pub ast_misses: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisWarning {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

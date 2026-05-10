@@ -39,21 +39,24 @@ The binary will be available at `./target/release/churnlens`.
 ## Usage
 
 ```bash
-churnlens [PATH] > report.json
+churnlens [PATH] --sort file --limit 100 > report.json
 ```
 
 * `PATH`: Root of the Git repository to analyze (defaults to `.`).
+* `--sort`: `file`, `risk`, `churn_score`, `cognitive`, `cyclomatic`, or `loc`.
+* `--limit`: Optional maximum number of functions in the report.
 
 ---
 
 ## Core Architecture
 
 ### 1. AST-Based Static Analysis
-* **Query-Based Parsing:** Uses `tree-sitter` declarative queries for high-performance extraction.
+* **Tree Walk Parsing:** Uses `tree-sitter` to parse TypeScript, TSX, JavaScript, and JSX, then walks the syntax tree to extract function metrics.
 * **Metrics:** Cyclomatic Complexity, Cognitive Complexity, Nesting Depth, and Lines of Code (LOC).
 
 ### 2. Git Metadata Mining
-* **Single-Pass Traversal:** $O(\text{commits} + \text{files})$ complexity using `git2`.
+* **Incremental Traversal:** Uses `git2` and a local cache. The Git cache is invalidated when repository identity, branch, algorithm version, or ancestry validation no longer match.
+* **Merge and Rename Handling:** Merge commits are compared against all parents. Rename detection is enabled and historical metrics are propagated from old paths to new paths.
 * **Refined Churn Formula:**
   `churn_score = (modifications + (bug_fixes * 2)) * log10(authors + 1)`
 
@@ -76,12 +79,24 @@ ChurnLens produces a single, machine-consumable JSON document.
 ### Top-Level Structure
 ```json
 {
-  "repository": "string (path)",
-  "timestamp": "RFC3339",
+  "schema_version": "string",
+  "analysis": {
+    "repository": "string (path)",
+    "commit": "string",
+    "branch": "string",
+    "timestamp": "RFC3339"
+  },
   "summary": {
     "total_functions": integer,
     "max_values": { "cyclomatic", "cognitive", "churn", "loc" },
     "distributions": { "risk_p95", "churn_p95", "cognitive_p95" }
+  },
+  "quality": {
+    "status": "complete | partial",
+    "git": { "available": true, "partial": false, "cache_reset": false, "processed_commits": 0 },
+    "cache": { "enabled": true, "loaded": true, "saved": true, "ast_hits": 0, "ast_misses": 0 },
+    "warnings": [],
+    "skipped_files": []
   },
   "functions": [ ... ]
 }
@@ -99,11 +114,24 @@ ChurnLens produces a single, machine-consumable JSON document.
 | `risk` | `object` | `base_score`, `nesting_penalty`, and `final_score`. |
 | `percentile` | `object` | Global rank (0.0 to 100.0) for risk, churn, and cognitive. |
 
+### Data Quality
+The `quality.status` field is `partial` when analysis completed but some data could not be collected. Examples include parser failures, unreadable files, Git mining errors, unsupported sort fields, or cache failures.
+
+Consumers should treat `quality.status = "partial"` as a non-authoritative report unless their workflow explicitly accepts partial telemetry.
+
+### Metric Semantics
+* AST cache invalidation uses a stable hash of the current file contents, so dirty working-tree files are reparsed.
+* Git churn is file-path based. Rename detection propagates historical metrics to the new path, but complex copy/split histories are not treated as semantic code identity tracking.
+* Bug-fix commits are detected from word-like commit-message tokens such as `fix`, `bug`, `issue`, `close`, and `resolve`.
+* Author identity uses Git author email when available, falling back to author name.
+* Normalized values are capped at `1.0`.
+* Percentile ranks use `0.0` for the lowest value and `100.0` for the highest value when at least two functions are present.
+
 ---
 
 ## Characteristics
 
-* **Deterministic:** Output is consistent for a given repository state.
+* **Deterministic:** Output is consistent for the same repository and working-tree contents.
 * **Performance:** Multi-threaded analysis using `Rayon`.
 * **Non-Goals:** This tool does not provide interactive UI or human-readable text tables; it is strictly a JSON data provider.
 

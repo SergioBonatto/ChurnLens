@@ -318,3 +318,66 @@ fn resets_git_cache_when_branch_changes() {
 
     assert!(report.quality.git.cache_reset);
 }
+
+#[test]
+fn analyzes_rust_and_c_repository() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+
+    let src_dir = repo_path.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+        fn main() {
+            let x = Some(1);
+            if let Some(y) = x {
+                println!("{}", y);
+            }
+            match x {
+                Some(_) => println!("ok"),
+                None => (),
+            }
+        }
+    "#,
+    )
+    .expect("rust file should be written");
+
+    fs::write(
+        src_dir.join("helper.c"),
+        r#"
+        int add(int a, int b) {
+            if (a > 0) {
+                return a + b;
+            }
+            return b;
+        }
+    "#,
+    )
+    .expect("c file should be written");
+
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+
+    assert_eq!(report.summary.total_functions, 2);
+
+    let rust_func = report
+        .functions
+        .iter()
+        .find(|f| f.file == "src/main.rs")
+        .expect("rust function should exist");
+    assert_eq!(rust_func.name, "main");
+    assert!(rust_func.cognitive_complexity >= 2);
+
+    let c_func = report
+        .functions
+        .iter()
+        .find(|f| f.file == "src/helper.c")
+        .expect("c function should exist");
+    assert_eq!(c_func.name, "add");
+    assert_eq!(c_func.cyclomatic_complexity, 2);
+}

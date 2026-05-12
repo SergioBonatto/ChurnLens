@@ -2,9 +2,12 @@ use crate::metrics::FunctionMetrics;
 use anyhow::Result;
 use tree_sitter::Node;
 
+use super::LanguageSupport;
+
 pub struct ComplexityEngine<'a> {
     source: &'a str,
     file_path: &'a str,
+    support: &'a dyn LanguageSupport,
 }
 
 struct FunctionState {
@@ -18,8 +21,12 @@ struct FunctionState {
 }
 
 impl<'a> ComplexityEngine<'a> {
-    pub fn new(source: &'a str, file_path: &'a str) -> Self {
-        Self { source, file_path }
+    pub fn new(source: &'a str, file_path: &'a str, support: &'a dyn LanguageSupport) -> Self {
+        Self {
+            source,
+            file_path,
+            support,
+        }
     }
 
     pub fn analyze(&self, root_node: Node) -> Result<Vec<FunctionMetrics>> {
@@ -30,43 +37,6 @@ impl<'a> ComplexityEngine<'a> {
         Ok(functions.into_iter().flatten().collect())
     }
 
-    fn extract_name(&self, node: Node) -> &'a str {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "identifier" || child.kind() == "property_identifier" {
-                return match child.utf8_text(self.source.as_bytes()) {
-                    Ok(text) => text,
-                    Err(_) => "<unknown>",
-                };
-            }
-        }
-
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "variable_declarator" || parent.kind() == "public_field_definition"
-            {
-                let mut p_cursor = parent.walk();
-                for child in parent.children(&mut p_cursor) {
-                    if child.kind() == "identifier" || child.kind() == "property_identifier" {
-                        return match child.utf8_text(self.source.as_bytes()) {
-                            Ok(text) => text,
-                            Err(_) => "<unknown>",
-                        };
-                    }
-                }
-            }
-            if parent.kind() == "assignment_expression" {
-                if let Some(left) = parent.child_by_field_name("left") {
-                    return match left.utf8_text(self.source.as_bytes()) {
-                        Ok(text) => text,
-                        Err(_) => "<unknown>",
-                    };
-                }
-            }
-        }
-
-        "<anonymous>"
-    }
-
     fn visit(
         &self,
         node: Node,
@@ -75,8 +45,8 @@ impl<'a> ComplexityEngine<'a> {
         depth: u32,
         last_op: Option<&str>,
     ) {
-        let entered_function = if is_function_node(node) {
-            let name = self.extract_name(node).to_string();
+        let entered_function = if self.support.is_function(node) {
+            let name = self.support.extract_name(node, self.source);
             let start_line = node.start_position().row as u32 + 1;
             let output_index = functions.len();
             functions.push(None);
@@ -99,13 +69,14 @@ impl<'a> ComplexityEngine<'a> {
 
         if let Some(function) = stack.last_mut() {
             let kind = node.kind();
-            if !entered_function && is_complexity_item(kind) {
+            if !entered_function && self.support.is_complexity_increment(node) {
                 function.cyclomatic += 1;
             }
 
             match kind {
                 "if_statement" | "for_statement" | "while_statement" | "do_statement"
-                | "switch_statement" | "catch_clause" | "ternary_expression" => {
+                | "switch_statement" | "catch_clause" | "ternary_expression" | "if_expression"
+                | "match_expression" | "match_arm" => {
                     let is_else_if = kind == "if_statement"
                         && node.parent().is_some_and(|p| p.kind() == "else_clause");
 
@@ -185,20 +156,6 @@ impl<'a> ComplexityEngine<'a> {
     }
 }
 
-fn is_function_node(node: Node) -> bool {
-    matches!(
-        node.kind(),
-        "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
-    )
-}
-
-fn is_complexity_item(kind: &str) -> bool {
-    matches!(
-        kind,
-        "if" | "for" | "while" | "do" | "case" | "catch" | "&&" | "||" | "?"
-    )
-}
-
 fn logical_operator(node: Node) -> Option<&'static str> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -213,11 +170,13 @@ fn logical_operator(node: Node) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::parser::TypeScriptAnalyzer;
+    use super::super::parser::AstParser;
+    use crate::ast::typescript::TypeScriptSupport;
     use crate::metrics::FunctionMetrics;
 
     fn analyze(source: &str) -> Vec<FunctionMetrics> {
-        TypeScriptAnalyzer::analyze_source(source, "file.ts").expect("source should parse")
+        let support = TypeScriptSupport::new(false);
+        AstParser::analyze_source(source, "file.ts", &support).expect("source should parse")
     }
 
     fn find<'a>(functions: &'a [FunctionMetrics], name: &str) -> &'a FunctionMetrics {

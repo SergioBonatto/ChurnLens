@@ -3,15 +3,23 @@ use crate::metrics::ChurnMetrics;
 use anyhow::{anyhow, Result};
 use git2::{Commit, Delta, DiffDelta, DiffFindOptions, DiffHunk, DiffOptions, Oid, Repository};
 use rayon::prelude::*;
+use regex::Regex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use xxhash_rust::xxh3::xxh3_128;
 
 pub struct GitAnalyzer;
 
 const COMMITS_PER_WORKER_CHUNK: usize = 32;
 const COMMITS_PER_BATCH: usize = 4096;
 const FULL_FILE_RANGE_END_LINE: u32 = 1_000_000_000;
+
+#[derive(Clone)]
+pub struct BugFixPatterns {
+    patterns: Vec<Regex>,
+    cache_key: String,
+}
 
 thread_local! {
      static REPO_HANDLE: RefCell<Option<ThreadLocalRepository>> = const { RefCell::new(None) };
@@ -61,6 +69,7 @@ impl GitAnalyzer {
         repository_path: &Path,
         branch: &str,
         head_oid: &str,
+        bug_fix_patterns: &BugFixPatterns,
     ) -> Result<GitMetricsResult> {
         let mut result = GitMetricsResult {
             cache: HashMap::new(),
@@ -69,6 +78,7 @@ impl GitAnalyzer {
                 branch: branch.to_string(),
                 head_oid: head_oid.to_string(),
                 algorithm_version: GIT_ALGORITHM_VERSION,
+                bug_fix_patterns_hash: bug_fix_patterns.cache_key().to_string(),
             },
             cache_reset: false,
             processed_commits: 0,
@@ -77,7 +87,12 @@ impl GitAnalyzer {
         };
 
         let mut last_commit_oid = last_commit_oid;
-        if !Self::is_git_cache_compatible(git_metadata.as_ref(), repository_path, branch) {
+        if !Self::is_git_cache_compatible(
+            git_metadata.as_ref(),
+            repository_path,
+            branch,
+            bug_fix_patterns,
+        ) {
             git_cache.clear();
             last_commit_oid = None;
             result.cache_reset = true;
@@ -131,14 +146,15 @@ impl GitAnalyzer {
         for oid in revwalk {
             pending.push(oid?);
             if pending.len() >= COMMITS_PER_BATCH {
-                let batch_metrics = Self::process_commit_batch(&repo_path, &pending);
+                let batch_metrics =
+                    Self::process_commit_batch(&repo_path, &pending, bug_fix_patterns);
                 Self::merge_batch_metrics(&mut new_metrics, batch_metrics);
                 pending.clear();
             }
         }
 
         if !pending.is_empty() {
-            let batch_metrics = Self::process_commit_batch(&repo_path, &pending);
+            let batch_metrics = Self::process_commit_batch(&repo_path, &pending, bug_fix_patterns);
             Self::merge_batch_metrics(&mut new_metrics, batch_metrics);
         }
 
@@ -218,6 +234,7 @@ impl GitAnalyzer {
         metadata: Option<&GitCacheMetadata>,
         repository_path: &Path,
         branch: &str,
+        bug_fix_patterns: &BugFixPatterns,
     ) -> bool {
         let Some(metadata) = metadata else {
             return false;
@@ -227,6 +244,7 @@ impl GitAnalyzer {
             && metadata.repository_path == repository_path.to_string_lossy()
             && metadata.branch == branch
             && !metadata.head_oid.is_empty()
+            && metadata.bug_fix_patterns_hash == bug_fix_patterns.cache_key()
     }
 
     fn get_modified_files_optimized(repo: &Repository, commit: &Commit) -> Result<ModifiedFiles> {
@@ -331,20 +349,28 @@ impl GitAnalyzer {
         Ok(())
     }
 
-    fn process_commit_batch(repo_path: &Path, oids: &[Oid]) -> GitBatchMetrics {
+    fn process_commit_batch(
+        repo_path: &Path,
+        oids: &[Oid],
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> GitBatchMetrics {
         oids.par_chunks(COMMITS_PER_WORKER_CHUNK)
-            .map(|chunk| Self::process_commit_chunk(repo_path, chunk))
+            .map(|chunk| Self::process_commit_chunk(repo_path, chunk, bug_fix_patterns))
             .reduce(GitBatchMetrics::default, |mut acc, metrics| {
                 Self::merge_batch_metrics(&mut acc, metrics);
                 acc
             })
     }
 
-    fn process_commit_chunk(repo_path: &Path, oids: &[Oid]) -> GitBatchMetrics {
+    fn process_commit_chunk(
+        repo_path: &Path,
+        oids: &[Oid],
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> GitBatchMetrics {
         match Self::with_thread_local_repo(repo_path, |repo| {
             let mut metrics = GitBatchMetrics::default();
             for oid in oids {
-                match Self::process_commit(repo, *oid) {
+                match Self::process_commit(repo, *oid, bug_fix_patterns) {
                     Ok(commit_metrics) => {
                         metrics.processed_commits += 1;
                         Self::merge_git_cache(&mut metrics.files, commit_metrics.files);
@@ -372,10 +398,14 @@ impl GitAnalyzer {
         }
     }
 
-    fn process_commit(repo: &Repository, oid: Oid) -> Result<GitBatchMetrics> {
+    fn process_commit(
+        repo: &Repository,
+        oid: Oid,
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> Result<GitBatchMetrics> {
         let commit = repo.find_commit(oid)?;
         let author = Self::author_identity(&commit);
-        let is_bug_fix = Self::is_bug_fix(&commit);
+        let is_bug_fix = Self::is_bug_fix(&commit, bug_fix_patterns);
         let modified_files = Self::get_modified_files_optimized(repo, &commit)?;
 
         let mut metrics = HashMap::new();
@@ -525,33 +555,61 @@ impl GitAnalyzer {
         author.name().unwrap_or("Unknown").to_string()
     }
 
-    fn is_bug_fix(commit: &Commit) -> bool {
-        if let Some(message) = commit.message() {
-            let lower_msg = message.to_lowercase();
-            lower_msg
-                .split(|ch: char| !ch.is_ascii_alphanumeric())
-                .any(|word| {
-                    matches!(
-                        word,
-                        "fix"
-                            | "fixes"
-                            | "fixed"
-                            | "bug"
-                            | "bugs"
-                            | "issue"
-                            | "issues"
-                            | "close"
-                            | "closes"
-                            | "closed"
-                            | "resolve"
-                            | "resolves"
-                            | "resolved"
-                    )
-                })
-        } else {
-            false
+    fn is_bug_fix(commit: &Commit, bug_fix_patterns: &BugFixPatterns) -> bool {
+        commit
+            .message()
+            .is_some_and(|message| bug_fix_patterns.is_match(message))
+    }
+}
+
+impl BugFixPatterns {
+    pub fn from_patterns(patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut compiled = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            compiled.push(Regex::new(pattern)?);
+        }
+        Ok(Self {
+            patterns: compiled,
+            cache_key: patterns_cache_key(&patterns.join("\n")),
+        })
+    }
+
+    pub fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+
+    fn is_match(&self, message: &str) -> bool {
+        self.patterns
+            .iter()
+            .any(|pattern| pattern.is_match(message))
+    }
+}
+
+impl Default for BugFixPatterns {
+    fn default() -> Self {
+        let patterns = [
+            r"(?i)\bfix(?:e[sd])?\b",
+            r"(?i)\bbug(?:s)?\b",
+            r"(?i)\bissue(?:s)?\b",
+            r"(?i)\bclos(?:e[sd]?|ing)\b",
+            r"(?i)\bresolv(?:e[sd]?|ing)\b",
+        ];
+        let compiled = patterns
+            .iter()
+            .map(|pattern| Regex::new(pattern).expect("default bug-fix pattern should compile"))
+            .collect();
+        Self {
+            patterns: compiled,
+            cache_key: patterns_cache_key(&patterns.join("\n")),
         }
     }
+}
+
+fn patterns_cache_key(patterns: &str) -> String {
+    format!("{:032x}", xxh3_128(patterns.as_bytes()))
 }
 
 fn hunk_path(delta: DiffDelta) -> Option<String> {

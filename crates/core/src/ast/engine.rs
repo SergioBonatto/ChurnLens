@@ -1,6 +1,7 @@
 use crate::metrics::FunctionMetrics;
 use anyhow::Result;
 use tree_sitter::Node;
+use xxhash_rust::xxh3::xxh3_128;
 
 use super::LanguageSupport;
 
@@ -330,12 +331,7 @@ fn function_body_start(node: Node) -> Option<usize> {
 }
 
 fn stable_hash_hex(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    format!("{:032x}", xxh3_128(bytes))
 }
 
 fn is_body_node(kind: &str) -> bool {

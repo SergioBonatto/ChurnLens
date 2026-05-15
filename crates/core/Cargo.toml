@@ -27,6 +27,9 @@ clap = { version = "4.4", features = ["derive"] }
 rayon = "1.7"
 anyhow = "1.0"
 regex = "1.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+memmap2 = "0.9"
+toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"

@@ -293,6 +293,34 @@ fn propagates_churn_across_renamed_files() {
 }
 
 #[test]
+fn honors_custom_bug_fix_patterns() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+    fs::write(
+        repo_path.join("churnlens.toml"),
+        r#"
+        [git]
+        bug_fix_patterns = ["CL-[0-9]+"]
+        "#,
+    )
+    .expect("config should be written");
+    write_source(repo_path, "function ticketSensitive() {}\n");
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "CL-123 repair production issue");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    let function = report
+        .functions
+        .iter()
+        .find(|function| function.name == "ticketSensitive")
+        .expect("function should exist");
+
+    assert_eq!(function.bug_fix_commits, 1);
+    assert_eq!(function.body_hash.len(), 32);
+}
+
+#[test]
 fn resets_git_cache_when_branch_changes() {
     let temp_dir = tempfile::tempdir().expect("temp dir should be created");
     let repo_path = temp_dir.path();

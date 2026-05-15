@@ -12,22 +12,27 @@ use ast::typescript::TypeScriptSupport;
 use ast::LanguageSupport;
 use cache::{AnalysisCache, CacheManager, FileCacheEntry, GitCacheEntry};
 use chrono::{DateTime, Utc};
-use git::GitAnalyzer;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use git::{BugFixPatterns, GitAnalyzer};
 use git2::Repository;
 use ignore::WalkBuilder;
+use memmap2::{Mmap, MmapOptions};
 use metrics::{
     AnalysisMetadata, AnalysisQuality, AnalysisStatus, AnalysisWarning, CacheAnalysisStatus,
     Distributions, FunctionMetrics, GitAnalysisStatus, MaxValues, NormalizedMetrics,
     PercentileMetrics, Report, RiskMetrics, ScoringPolicy, SkippedFile, SummaryStats,
 };
 use rayon::iter::{ParallelBridge, ParallelIterator};
+use serde::Deserialize;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use xxhash_rust::xxh3::xxh3_128;
 
 const SCHEMA_VERSION: &str = "0.3.0";
 const FALLBACK_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
@@ -41,6 +46,8 @@ const WEIGHT_AUTHORS: f64 = 0.10;
 const THRESHOLD_CRITICAL: f64 = 95.0;
 const THRESHOLD_HIGH: f64 = 80.0;
 const THRESHOLD_MEDIUM: f64 = 50.0;
+const MAX_PARALLEL_FILE_READS: usize = 8;
+const MMAP_FILE_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
 struct RepoContext {
     repo: Option<Repository>,
@@ -51,6 +58,19 @@ struct RepoContext {
     cache: AnalysisCache,
     cache_loaded: bool,
     repo_path_abs: std::path::PathBuf,
+    config: ChurnLensConfig,
+}
+
+#[derive(Default, Deserialize)]
+struct ChurnLensConfig {
+    #[serde(default)]
+    git: GitConfig,
+}
+
+#[derive(Default, Deserialize)]
+struct GitConfig {
+    #[serde(default)]
+    bug_fix_patterns: Vec<String>,
 }
 
 struct NormalizationCaps {
@@ -118,12 +138,23 @@ pub fn analyze_repository_with_authors(
     let mut skipped_files = Vec::new();
 
     let mut ctx = load_repository_context(repo_path, &mut warnings)?;
+    let bug_fix_patterns = match BugFixPatterns::from_patterns(&ctx.config.git.bug_fix_patterns) {
+        Ok(patterns) => patterns,
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "invalid_bug_fix_pattern".to_string(),
+                message: format!("Invalid bug-fix pattern configuration: {err}"),
+            });
+            BugFixPatterns::default()
+        }
+    };
     let (mut git_cache, git_status) = collect_git_analysis(
         ctx.repo.as_ref(),
         &ctx.repo_path_abs,
         &ctx.branch,
         &ctx.commit_hash,
         &mut ctx.cache,
+        &bug_fix_patterns,
         &mut warnings,
     );
 
@@ -323,12 +354,7 @@ fn normalized_value(value: f64, cap: f64) -> f64 {
 }
 
 fn stable_content_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    format!("{:032x}", xxh3_128(bytes))
 }
 
 fn sort_functions(
@@ -542,6 +568,69 @@ struct WorkerResult {
     skipped_files: Vec<SkippedFile>,
 }
 
+#[derive(Clone)]
+struct FileReadLimiter {
+    sender: Sender<()>,
+    receiver: Receiver<()>,
+}
+
+struct FileReadPermit {
+    sender: Sender<()>,
+}
+
+enum FileContent {
+    Bytes(Vec<u8>),
+    Mmap(Mmap),
+}
+
+impl FileReadLimiter {
+    fn new(limit: usize) -> Self {
+        let limit = limit.max(1);
+        let (sender, receiver) = bounded(limit);
+        for _ in 0..limit {
+            sender
+                .send(())
+                .expect("file read limiter should accept initial permits");
+        }
+        Self { sender, receiver }
+    }
+
+    fn acquire(&self) -> Result<FileReadPermit> {
+        self.receiver.recv()?;
+        Ok(FileReadPermit {
+            sender: self.sender.clone(),
+        })
+    }
+}
+
+impl Drop for FileReadPermit {
+    fn drop(&mut self) {
+        let _ = self.sender.send(());
+    }
+}
+
+impl FileContent {
+    fn read(path: &Path, limiter: &FileReadLimiter) -> Result<Self> {
+        let _permit = limiter.acquire()?;
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() >= MMAP_FILE_THRESHOLD_BYTES {
+            let file = File::open(path)?;
+            // SAFETY: The file is opened read-only and the mapping is only exposed as immutable bytes.
+            let mmap = unsafe { MmapOptions::new().map(&file)? };
+            Ok(Self::Mmap(mmap))
+        } else {
+            Ok(Self::Bytes(std::fs::read(path)?))
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Mmap(mmap) => mmap,
+        }
+    }
+}
+
 impl WorkerAccumulator {
     fn into_parts(self) -> WorkerResult {
         WorkerResult {
@@ -628,6 +717,7 @@ fn load_repository_context(
         && (!cache.files.is_empty()
             || !cache.git_cache.is_empty()
             || cache.last_commit_oid.is_some());
+    let config = load_config(&repo_path_abs, warnings);
 
     Ok(RepoContext {
         repo,
@@ -638,7 +728,36 @@ fn load_repository_context(
         cache,
         cache_loaded,
         repo_path_abs,
+        config,
     })
+}
+
+fn load_config(repo_path: &Path, warnings: &mut Vec<AnalysisWarning>) -> ChurnLensConfig {
+    let config_path = repo_path.join("churnlens.toml");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return ChurnLensConfig::default();
+        }
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "config_read_failed".to_string(),
+                message: format!("Failed to read {}: {err}", config_path.display()),
+            });
+            return ChurnLensConfig::default();
+        }
+    };
+
+    match toml::from_str(&content) {
+        Ok(config) => config,
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                code: "config_parse_failed".to_string(),
+                message: format!("Failed to parse {}: {err}", config_path.display()),
+            });
+            ChurnLensConfig::default()
+        }
+    }
 }
 
 fn collect_git_analysis(
@@ -647,6 +766,7 @@ fn collect_git_analysis(
     branch: &str,
     commit_hash: &str,
     cache: &mut AnalysisCache,
+    bug_fix_patterns: &BugFixPatterns,
     warnings: &mut Vec<AnalysisWarning>,
 ) -> (HashMap<String, GitCacheEntry>, GitAnalysisStatus) {
     let mut git_status = GitAnalysisStatus {
@@ -665,6 +785,7 @@ fn collect_git_analysis(
             repo_path_abs,
             branch,
             commit_hash,
+            bug_fix_patterns,
         ) {
             Ok(git_result) => {
                 git_status.partial = git_result.partial;
@@ -702,6 +823,7 @@ fn analyze_files_parallel(
     include_authors: bool,
     shutdown: Arc<AtomicBool>,
 ) -> WorkerResult {
+    let file_read_limiter = Arc::new(FileReadLimiter::new(MAX_PARALLEL_FILE_READS));
     let walker = WalkBuilder::new(repo_path_abs)
         .standard_filters(true)
         .hidden(false)
@@ -751,6 +873,7 @@ fn analyze_files_parallel(
             let rel_path_str = rel_path.to_string_lossy().to_string();
 
             let registry = Arc::clone(&registry);
+            let file_read_limiter = Arc::clone(&file_read_limiter);
             if registry.get_support(&rel_path_str).is_none() {
                 return None;
             }
@@ -760,7 +883,7 @@ fn analyze_files_parallel(
                 ..WorkerOutput::default()
             };
 
-            let source = match std::fs::read(path) {
+            let source = match FileContent::read(path, &file_read_limiter) {
                 Ok(source) => source,
                 Err(err) => {
                     output.skipped_files.push(SkippedFile {
@@ -770,7 +893,8 @@ fn analyze_files_parallel(
                     return Some(output);
                 }
             };
-            let content_hash = stable_content_hash(&source);
+            let source_bytes = source.as_bytes();
+            let content_hash = stable_content_hash(source_bytes);
 
             let mut functions = if let Some(cached_entry) = cache.files.get(&rel_path_str) {
                 if cached_entry.content_hash == content_hash {
@@ -779,7 +903,7 @@ fn analyze_files_parallel(
                 } else {
                     output.cache_miss = 1;
                     match AnalysisWorker::process_file_from_source(
-                        &source,
+                        source_bytes,
                         &rel_path_str,
                         &registry,
                     ) {
@@ -795,7 +919,11 @@ fn analyze_files_parallel(
                 }
             } else {
                 output.cache_miss = 1;
-                match AnalysisWorker::process_file_from_source(&source, &rel_path_str, &registry) {
+                match AnalysisWorker::process_file_from_source(
+                    source_bytes,
+                    &rel_path_str,
+                    &registry,
+                ) {
                     Ok(functions) => functions,
                     Err(err) => {
                         output.skipped_files.push(SkippedFile {

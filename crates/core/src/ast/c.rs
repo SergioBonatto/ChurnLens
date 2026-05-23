@@ -31,20 +31,26 @@ impl LanguageSupport for CSupport {
     }
 
     fn extract_name(&self, node: Node, source: &str) -> String {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "function_declarator" {
-                let mut d_cursor = child.walk();
-                for d_child in child.children(&mut d_cursor) {
-                    if d_child.kind() == "identifier" {
-                        return match d_child.utf8_text(source.as_bytes()) {
-                            Ok(text) => text.to_string(),
-                            Err(_) => "<unknown>".to_string(),
-                        };
-                    }
-                }
-            }
-        }
-        "<anonymous>".to_string()
+        let Some(declarator) = first_child_of_kind(node, "function_declarator") else {
+            return "<anonymous>".to_string();
+        };
+        let Some(identifier) = first_child_of_kind(declarator, "identifier") else {
+            return "<anonymous>".to_string();
+        };
+
+        node_text_or_unknown(identifier, source)
+    }
+}
+
+fn first_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    let child = node.children(&mut cursor).find(|child| child.kind() == kind);
+    child
+}
+
+fn node_text_or_unknown(node: Node, source: &str) -> String {
+    match node.utf8_text(source.as_bytes()) {
+        Ok(text) => text.to_string(),
+        Err(_) => "<unknown>".to_string(),
     }
 }

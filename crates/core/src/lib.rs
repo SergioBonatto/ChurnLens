@@ -474,15 +474,15 @@ enum SortKey {
 
 impl SortKey {
     fn from_str(sort_by: &str) -> Option<Self> {
-        match sort_by {
-            "file" | "location" => Some(Self::Location),
-            "churn_score" | "churn" => Some(Self::Churn),
-            "risk" | "risk_score" => Some(Self::Risk),
-            "cognitive" | "cognitive_complexity" => Some(Self::Cognitive),
-            "cyclomatic" | "cyclomatic_complexity" => Some(Self::Cyclomatic),
-            "loc" | "lines_of_code" => Some(Self::LinesOfCode),
-            _ => None,
-        }
+        Some(match sort_by {
+            "file" | "location" => Self::Location,
+            "churn_score" | "churn" => Self::Churn,
+            "risk" | "risk_score" => Self::Risk,
+            "cognitive" | "cognitive_complexity" => Self::Cognitive,
+            "cyclomatic" | "cyclomatic_complexity" => Self::Cyclomatic,
+            "loc" | "lines_of_code" => Self::LinesOfCode,
+            _ => return None,
+        })
     }
 
     fn compare(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
@@ -495,11 +495,27 @@ impl SortKey {
     fn metric_ordering(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
         match self {
             Self::Location => CmpOrdering::Equal,
+            Self::Churn | Self::Risk => self.float_metric_ordering(a, b),
+            Self::Cognitive | Self::Cyclomatic | Self::LinesOfCode => {
+                self.integer_metric_ordering(a, b)
+            }
+        }
+    }
+
+    fn float_metric_ordering(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
+        match self {
             Self::Churn => b.churn_score.total_cmp(&a.churn_score),
             Self::Risk => risk_score(b).total_cmp(&risk_score(a)),
+            _ => CmpOrdering::Equal,
+        }
+    }
+
+    fn integer_metric_ordering(&self, a: &FunctionMetrics, b: &FunctionMetrics) -> CmpOrdering {
+        match self {
             Self::Cognitive => b.cognitive_complexity.cmp(&a.cognitive_complexity),
             Self::Cyclomatic => b.cyclomatic_complexity.cmp(&a.cyclomatic_complexity),
             Self::LinesOfCode => b.lines_of_code.cmp(&a.lines_of_code),
+            _ => CmpOrdering::Equal,
         }
     }
 }

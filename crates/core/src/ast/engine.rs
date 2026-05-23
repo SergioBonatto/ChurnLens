@@ -74,18 +74,28 @@ impl<'a> ComplexityEngine<'a> {
         traversal_stack: &mut Vec<TraversalEvent<'tree>>,
     ) {
         while let Some(event) = traversal_stack.pop() {
-            match event {
-                TraversalEvent::Enter(node, depth, last_op) => self.enter_node(
-                    node,
-                    function_stack,
-                    functions,
-                    traversal_stack,
-                    depth,
-                    last_op,
-                ),
-                TraversalEvent::ExitFunction(node) => {
-                    self.finish_function(node, function_stack, functions);
-                }
+            self.handle_traversal_event(event, function_stack, functions, traversal_stack);
+        }
+    }
+
+    fn handle_traversal_event<'tree>(
+        &self,
+        event: TraversalEvent<'tree>,
+        function_stack: &mut Vec<FunctionState>,
+        functions: &mut Vec<Option<FunctionMetrics>>,
+        traversal_stack: &mut Vec<TraversalEvent<'tree>>,
+    ) {
+        match event {
+            TraversalEvent::Enter(node, depth, last_op) => self.enter_node(
+                node,
+                function_stack,
+                functions,
+                traversal_stack,
+                depth,
+                last_op,
+            ),
+            TraversalEvent::ExitFunction(node) => {
+                self.finish_function(node, function_stack, functions);
             }
         }
     }
@@ -181,12 +191,14 @@ impl<'a> ComplexityEngine<'a> {
         last_op: Option<&'static str>,
         state: &mut NodeState,
     ) {
-        match node.kind() {
-            kind if is_nesting_complexity_node(kind) => {
-                increment_nesting_cognitive(node, kind, function, active_depth, state);
-            }
-            "binary_expression" => increment_logical_cognitive(node, function, last_op, state),
-            _ => {}
+        let kind = node.kind();
+        if is_nesting_complexity_node(kind) {
+            increment_nesting_cognitive(node, kind, function, active_depth, state);
+            return;
+        }
+
+        if kind == "binary_expression" {
+            increment_logical_cognitive(node, function, last_op, state);
         }
     }
 

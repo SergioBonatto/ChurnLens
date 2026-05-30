@@ -60,27 +60,35 @@ struct ChangedRange {
     end_line: u32,
 }
 
+pub struct GitAnalysisContext<'a> {
+    pub repo_path: &'a Path,
+    pub branch: &'a str,
+    pub head_oid: &'a str,
+}
+
 impl GitAnalyzer {
     pub fn get_all_file_metrics(
         repo: &Repository,
         mut git_cache: HashMap<String, GitCacheEntry>,
         git_metadata: Option<GitCacheMetadata>,
         last_commit_oid: Option<String>,
-        repository_path: &Path,
-        branch: &str,
-        head_oid: &str,
+        ctx: GitAnalysisContext,
         bug_fix_patterns: &BugFixPatterns,
     ) -> Result<GitMetricsResult> {
-        let mut result =
-            Self::initial_git_metrics_result(repository_path, branch, head_oid, bug_fix_patterns);
+        let mut result = Self::initial_git_metrics_result(
+            ctx.repo_path,
+            ctx.branch,
+            ctx.head_oid,
+            bug_fix_patterns,
+        );
 
         let mut last_commit_oid = last_commit_oid;
         Self::reset_incompatible_git_cache(
             &mut git_cache,
             &mut last_commit_oid,
             git_metadata.as_ref(),
-            repository_path,
-            branch,
+            ctx.repo_path,
+            ctx.branch,
             bug_fix_patterns,
             &mut result,
         );
@@ -94,7 +102,7 @@ impl GitAnalyzer {
             &mut revwalk,
             &mut git_cache,
             last_commit_oid.as_deref(),
-            head_oid,
+            ctx.head_oid,
             &mut result,
         )? {
             result.cache = git_cache;

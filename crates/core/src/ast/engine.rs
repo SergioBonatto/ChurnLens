@@ -654,8 +654,7 @@ fn call_name(node: Node, source: &str) -> Option<String> {
 
 fn normalize_call_name(text: &str) -> String {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .filter(|part| !part.is_empty())
-        .next_back()
+        .rfind(|part| !part.is_empty())
         .unwrap_or_default()
         .to_string()
 }

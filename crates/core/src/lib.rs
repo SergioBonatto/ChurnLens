@@ -13,7 +13,7 @@ use ast::LanguageSupport;
 use cache::{AnalysisCache, CacheManager, FileCacheEntry, GitCacheEntry};
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use git::{BugFixPatterns, GitAnalyzer};
+use git::{BugFixPatterns, GitAnalysisContext, GitAnalyzer};
 use git2::Repository;
 use ignore::WalkBuilder;
 use memmap2::{Mmap, MmapOptions};
@@ -104,6 +104,24 @@ struct NormalizationCaps {
     coverage_gap: f64,
 }
 
+struct AnalysisResults<'a> {
+    warnings: Vec<AnalysisWarning>,
+    skipped_files: Vec<SkippedFile>,
+    functions: Vec<FunctionMetrics>,
+    git_cache: &'a HashMap<String, GitCacheEntry>,
+    total_unique_authors: usize,
+}
+
+struct WorkerContext<'a> {
+    repo_path_abs: &'a Path,
+    registry: Arc<LanguageRegistry>,
+    cache: &'a AnalysisCache,
+    git_cache: &'a HashMap<String, GitCacheEntry>,
+    include_authors: bool,
+    file_read_limiter: Arc<FileReadLimiter>,
+    shutdown: &'a AtomicBool,
+}
+
 struct ScoringContext {
     max_values: MaxValues,
     caps: NormalizationCaps,
@@ -127,7 +145,15 @@ impl LanguageRegistry {
             ],
         }
     }
+}
 
+impl Default for LanguageRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LanguageRegistry {
     pub fn get_support(&self, file_path: &str) -> Option<&dyn LanguageSupport> {
         let path = Path::new(file_path);
         let ext = path.extension()?.to_str()?;
@@ -213,11 +239,13 @@ pub fn analyze_repository_with_authors(
             scoring_policy,
             git_status,
             cache_stats,
-            warnings,
-            skipped_files,
-            functions,
-            &git_cache,
-            total_unique_authors,
+            AnalysisResults {
+                warnings,
+                skipped_files,
+                functions,
+                git_cache: &git_cache,
+                total_unique_authors,
+            },
         ));
     }
 
@@ -281,11 +309,7 @@ fn empty_analysis_report(
     scoring_policy: ScoringPolicy,
     git_status: GitAnalysisStatus,
     cache_stats: CacheStats,
-    warnings: Vec<AnalysisWarning>,
-    skipped_files: Vec<SkippedFile>,
-    functions: Vec<FunctionMetrics>,
-    git_cache: &HashMap<String, GitCacheEntry>,
-    total_unique_authors: usize,
+    results: AnalysisResults,
 ) -> Report {
     let quality = build_quality(
         git_status,
@@ -293,8 +317,8 @@ fn empty_analysis_report(
         ctx.cache_loaded,
         false,
         cache_stats,
-        warnings,
-        skipped_files,
+        results.warnings,
+        results.skipped_files,
     );
 
     Report {
@@ -308,13 +332,17 @@ fn empty_analysis_report(
         scoring_policy,
         summary: SummaryStats {
             total_functions: 0,
-            project_stats: build_project_stats(&functions, git_cache, total_unique_authors),
-            coverage: build_project_coverage(&functions),
+            project_stats: build_project_stats(
+                &results.functions,
+                results.git_cache,
+                results.total_unique_authors,
+            ),
+            coverage: build_project_coverage(&results.functions),
             max_values: None,
             distributions: None,
         },
         quality,
-        functions,
+        functions: results.functions,
     }
 }
 
@@ -1364,9 +1392,11 @@ fn collect_git_analysis(
         std::mem::take(&mut cache.git_cache),
         cache.git_metadata.clone(),
         cache.last_commit_oid.clone(),
-        repo_path_abs,
-        branch,
-        commit_hash,
+        GitAnalysisContext {
+            repo_path: repo_path_abs,
+            branch,
+            head_oid: commit_hash,
+        },
         bug_fix_patterns,
     ) {
         Ok(git_result) => apply_git_metrics_result(git_result, cache, &mut git_status, warnings),
@@ -1420,20 +1450,19 @@ fn analyze_files_parallel(
         .hidden(false)
         .build();
 
+    let ctx = WorkerContext {
+        repo_path_abs,
+        registry: Arc::clone(&registry),
+        cache,
+        git_cache,
+        include_authors,
+        file_read_limiter: Arc::clone(&file_read_limiter),
+        shutdown: &shutdown,
+    };
+
     walker
         .par_bridge()
-        .filter_map(|entry| {
-            process_walk_entry(
-                entry,
-                repo_path_abs,
-                Arc::clone(&registry),
-                cache,
-                git_cache,
-                include_authors,
-                Arc::clone(&file_read_limiter),
-                &shutdown,
-            )
-        })
+        .filter_map(|entry| process_walk_entry(entry, &ctx))
         .fold(WorkerAccumulator::default, |mut acc, output| {
             acc.functions.extend(output.functions);
             if let Some((path, entry)) = output.cache_entry {
@@ -1463,31 +1492,26 @@ fn analyze_files_parallel(
 
 fn process_walk_entry(
     entry: std::result::Result<ignore::DirEntry, ignore::Error>,
-    repo_path_abs: &Path,
-    registry: Arc<LanguageRegistry>,
-    cache: &AnalysisCache,
-    git_cache: &HashMap<String, GitCacheEntry>,
-    include_authors: bool,
-    file_read_limiter: Arc<FileReadLimiter>,
-    shutdown: &AtomicBool,
+    ctx: &WorkerContext,
 ) -> Option<WorkerOutput> {
-    let entry = match prepare_walk_entry(entry, shutdown)? {
+    let entry = match prepare_walk_entry(entry, ctx.shutdown)? {
         Ok(entry) => entry,
         Err(output) => return Some(output),
     };
     let path = entry.path();
-    let rel_path_str = match supported_relative_path(path, repo_path_abs, registry.as_ref())? {
-        Ok(path) => path,
-        Err(output) => return Some(output),
-    };
+    let rel_path_str =
+        match supported_relative_path(path, ctx.repo_path_abs, ctx.registry.as_ref())? {
+            Ok(path) => path,
+            Err(output) => return Some(*output),
+        };
     analyze_supported_file(
         path,
         rel_path_str,
-        registry,
-        cache,
-        git_cache,
-        include_authors,
-        file_read_limiter,
+        Arc::clone(&ctx.registry),
+        ctx.cache,
+        ctx.git_cache,
+        ctx.include_authors,
+        Arc::clone(&ctx.file_read_limiter),
     )
 }
 
@@ -1506,7 +1530,7 @@ fn supported_relative_path(
     path: &Path,
     repo_path_abs: &Path,
     registry: &LanguageRegistry,
-) -> Option<Result<String, WorkerOutput>> {
+) -> Option<Result<String, Box<WorkerOutput>>> {
     if !path.is_file() {
         return None;
     }
@@ -1532,16 +1556,16 @@ fn walk_entry_failed_output(err: ignore::Error) -> WorkerOutput {
     }
 }
 
-fn relative_path_string(path: &Path, repo_path_abs: &Path) -> Result<String, WorkerOutput> {
+fn relative_path_string(path: &Path, repo_path_abs: &Path) -> Result<String, Box<WorkerOutput>> {
     match path.strip_prefix(repo_path_abs) {
         Ok(path) => Ok(path.to_string_lossy().to_string()),
-        Err(err) => Err(WorkerOutput {
+        Err(err) => Err(Box::new(WorkerOutput {
             warnings: vec![AnalysisWarning {
                 code: "path_error".to_string(),
                 message: format!("Failed to strip prefix for {}: {}", path.display(), err),
             }],
             ..WorkerOutput::default()
-        }),
+        })),
     }
 }
 

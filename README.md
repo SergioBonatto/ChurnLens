@@ -104,8 +104,8 @@ The engine derives a multi-factored risk profile:
 $$\mathrm{FinalRisk} = \mathrm{BaseScore} \times \mathrm{NestingPenalty} \times \mathrm{FanInMultiplier}$$
 
 * **Base Score Weights:** Cognitive Complexity (30%), Historical Churn (20%), Recent Churn (15%), Cyclomatic Complexity (10%), Fan-In (10%), Lines of Code (5%), Unique Authors (5%), and Coverage Gap (5%).
-* **Nesting Penalty:** $\displaystyle 1.0 + \left(\frac{\text{max\_depth}}{4}\right)^2 \times 0.20$
-* **Fan-In Multiplier:** $1.0 + (\text{normalized\_fan\_in} \times 0.25)$
+* **Nesting Penalty:** $\displaystyle 1.0 + \left(\frac{max\_depth}{4}\right)^2 \times 0.20$
+* **Fan-In Multiplier:** $1.0 + (normalized\_fan\_in \times 0.25)$
 * **Primary Driver:** The telemetry object identifies the exact metric that contributed most heavily to the `BaseScore` to give downstream agents a clear target.
 
 ---

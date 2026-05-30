@@ -1,12 +1,12 @@
 use anyhow::Result;
-use churnlens::analyze_repository;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use uchikomi::analyze_repository_with_authors;
 
 #[derive(Parser, Debug)]
-#[command(name = "churnlens")]
+#[command(name = "uchikomi")]
 #[command(about = "Analyze code complexity and churn", long_about = None)]
 struct Args {
     /// Path to repository
@@ -24,6 +24,10 @@ struct Args {
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
+
+    /// Include list of authors for each function
+    #[arg(long)]
+    include_authors: bool,
 }
 
 fn main() -> Result<()> {
@@ -48,7 +52,13 @@ fn main() -> Result<()> {
         r.store(true, Ordering::SeqCst);
     })?;
 
-    let report = analyze_repository(&args.path, &args.sort, args.limit, shutdown)?;
+    let report = analyze_repository_with_authors(
+        &args.path,
+        &args.sort,
+        args.limit,
+        args.include_authors,
+        shutdown,
+    )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
 
     Ok(())

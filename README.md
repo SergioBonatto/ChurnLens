@@ -79,8 +79,7 @@ Leverages `libgit2` for high-fidelity repository mining with precise line-to-AST
 * **Merge and Rename Tracking:** Compares merge commits against all parents to preserve attribution. Historical metrics are explicitly propagated across file renames.
 * **Refined Churn Formula:**
 
-$$\text{churn\_score} = (\text{modifications} + (\text{bug\_fixes} \times 2)) \times \log_{10}(\text{authors} + 1)$$
-
+$$\mathrm{churn_score} = (\mathrm{modifications} + (\mathrm{bug_fixes} \times 2)) \times \log_{10}(\mathrm{authors} + 1)$$
 
 * **Velocity Metrics:** Tracks code acceleration by comparing the 7-day modification rate against the 90-day baseline, classifying files into `accelerating` (ratio > 1.25), `cooling` (ratio < 0.75), or `stable`.
 
@@ -95,20 +94,17 @@ To prevent extreme outliers ("God Functions") from compressing the rest of the r
 * If a maximum value exceeds $3\times$ the 95th percentile ($p95$), the denominator is capped at the 99th percentile ($p99$).
 * All metrics are then globally scaled between $[0.0, 1.0]$ using logarithmic smoothing:
 
-$$\text{normalized} = \frac{\ln(1 + \text{value})}{\ln(1 + \text{cap})}$$
-
-
+$$\mathrm{normalized} = \frac{\ln(1 + \mathrm{value})}{\ln(1 + \mathrm{cap})}$$
 
 ### 5. Risk Scoring Framework
 
 The engine derives a multi-factored risk profile:
 
-
-$$\text{FinalRisk} = \text{BaseScore} \times \text{NestingPenalty} \times \text{FanInMultiplier}$$
+$$\mathrm{FinalRisk} = \mathrm{BaseScore} \times \mathrm{NestingPenalty} \times \mathrm{FanInMultiplier}$$
 
 * **Base Score Weights:** Cognitive Complexity (35%), Historical Churn (30%), Cyclomatic Complexity (15%), Lines of Code (10%), Unique Authors (10%).
-* **Nesting Penalty:** $\displaystyle 1.0 + \left(\frac{\text{max\_depth}}{4}\right)^2 \times 0.20$
-* **Fan-In Multiplier:** $1.0 + (\text{normalized\_fan\_in} \times 0.25)$
+* **Nesting Penalty:** $\displaystyle 1.0 + \left(\frac{\text{max\\_depth}}{4}\right)^2 \times 0.20$
+* **Fan-In Multiplier:** $1.0 + (\text{normalized\\_fan\\_in} \times 0.25)$
 * **Primary Driver:** The telemetry object identifies the exact metric that contributed most heavily to the `BaseScore` to give downstream agents a clear target.
 
 ---

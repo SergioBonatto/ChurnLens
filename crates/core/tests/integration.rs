@@ -1,10 +1,10 @@
-use churnlens::analyze_repository;
-use churnlens::metrics::AnalysisStatus;
 use git2::{Repository, Signature};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use uchikomi::analyze_repository;
+use uchikomi::metrics::AnalysisStatus;
 
 fn assert_close(actual: f64, expected: f64) {
     assert!(
@@ -31,13 +31,7 @@ fn commit_all(repo: &Repository, message: &str) {
     let tree = repo.find_tree(tree_id).expect("tree should exist");
     let signature =
         Signature::now("Test User", "test@example.com").expect("signature should build");
-    let parents = match repo.head() {
-        Ok(head) => {
-            let parent = head.peel_to_commit().expect("head should peel to commit");
-            vec![parent]
-        }
-        Err(_) => Vec::new(),
-    };
+    let parents = commit_parents(repo);
     let parent_refs = parents.iter().collect::<Vec<_>>();
     repo.commit(
         Some("HEAD"),
@@ -48,6 +42,16 @@ fn commit_all(repo: &Repository, message: &str) {
         &parent_refs,
     )
     .expect("commit should be created");
+}
+
+fn commit_parents(repo: &Repository) -> Vec<git2::Commit<'_>> {
+    match repo.head() {
+        Ok(head) => {
+            let parent = head.peel_to_commit().expect("head should peel to commit");
+            vec![parent]
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 fn write_source(repo_path: &Path, source: &str) {
@@ -77,7 +81,7 @@ fn analyzes_small_git_repository() {
     let report =
         analyze_repository(repo_path, "file", None, shutdown()).expect("repository should analyze");
 
-    assert_eq!(report.schema_version, "0.2.0");
+    assert_eq!(report.schema_version, "0.4.0");
     assert_eq!(report.quality.status, AnalysisStatus::Complete);
     assert!(report.quality.warnings.is_empty());
     assert!(report.quality.skipped_files.is_empty());
@@ -293,6 +297,145 @@ fn propagates_churn_across_renamed_files() {
 }
 
 #[test]
+fn honors_custom_bug_fix_patterns() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+    fs::write(
+        repo_path.join("uchikomi.toml"),
+        r#"
+        [git]
+        bug_fix_patterns = ["CL-[0-9]+"]
+        "#,
+    )
+    .expect("config should be written");
+    write_source(repo_path, "function ticketSensitive() {}\n");
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "CL-123 repair production issue");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    let function = report
+        .functions
+        .iter()
+        .find(|function| function.name == "ticketSensitive")
+        .expect("function should exist");
+
+    assert_eq!(function.bug_fix_commits, 1);
+    assert_eq!(function.body_hash.len(), 32);
+}
+
+#[test]
+fn reports_temporal_churn_coupling_and_reachability() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+    write_source(
+        repo_path,
+        r#"
+        export function entry() {
+            helper();
+        }
+
+        function helper() {
+            return 1;
+        }
+
+        function unused() {
+            return 2;
+        }
+        "#,
+    );
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    assert!(report.summary.coverage.is_none());
+    assert!(report.summary.project_stats.dead_code.unreachable_functions >= 1);
+    assert!(report
+        .summary
+        .project_stats
+        .dead_code
+        .functions
+        .iter()
+        .any(|function| {
+            function.name == "unused"
+                && function.file == "src/index.ts"
+                && function.kind == "unreachable_private"
+                && function.safe_to_delete
+        }));
+
+    let entry = report
+        .functions
+        .iter()
+        .find(|function| function.name == "entry")
+        .expect("entry function should exist");
+    assert_eq!(entry.coupling.fan_out, 1);
+    assert_eq!(entry.churn.times_modified, entry.times_modified);
+    assert!(entry.churn.last_modified.is_some());
+
+    let helper = report
+        .functions
+        .iter()
+        .find(|function| function.name == "helper")
+        .expect("helper function should exist");
+    assert_eq!(helper.coupling.fan_in, 1);
+    assert_eq!(helper.reachability.kind, "reachable");
+
+    let unused = report
+        .functions
+        .iter()
+        .find(|function| function.name == "unused")
+        .expect("unused function should exist");
+    assert_eq!(unused.reachability.kind, "unreachable_private");
+}
+
+#[test]
+fn applies_lcov_coverage_to_function_ranges() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+    write_source(
+        repo_path,
+        r#"
+        function covered() {
+            return 1;
+        }
+        "#,
+    );
+    let coverage_dir = repo_path.join("coverage");
+    fs::create_dir_all(&coverage_dir).expect("coverage dir should be created");
+    fs::write(
+        coverage_dir.join("lcov.info"),
+        "SF:src/index.ts\nDA:2,1\nDA:3,0\nDA:4,1\nBRDA:3,0,0,0\nBRDA:3,0,1,-\nend_of_record\n",
+    )
+    .expect("coverage file should be written");
+
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    let coverage = report
+        .summary
+        .coverage
+        .as_ref()
+        .expect("project coverage should be available");
+    assert!(coverage.available);
+
+    let function = report
+        .functions
+        .iter()
+        .find(|function| function.name == "covered")
+        .expect("covered function should exist");
+    let function_coverage = function
+        .coverage
+        .as_ref()
+        .expect("function coverage should be available");
+    assert!(function_coverage.available);
+    assert!(function_coverage.line_coverage > 0.0);
+    assert!(function_coverage.risk_coverage_gap >= 0.0);
+}
+
+#[test]
 fn resets_git_cache_when_branch_changes() {
     let temp_dir = tempfile::tempdir().expect("temp dir should be created");
     let repo_path = temp_dir.path();
@@ -317,4 +460,107 @@ fn resets_git_cache_when_branch_changes() {
         analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
 
     assert!(report.quality.git.cache_reset);
+}
+
+#[test]
+fn analyzes_rust_and_c_repository() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+
+    let src_dir = repo_path.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+        fn main() {
+            let x = Some(1);
+            if let Some(y) = x {
+                println!("{}", y);
+            }
+            match x {
+                Some(_) => println!("ok"),
+                None => (),
+            }
+        }
+    "#,
+    )
+    .expect("rust file should be written");
+
+    fs::write(
+        src_dir.join("helper.c"),
+        r#"
+        int add(int a, int b) {
+            if (a > 0) {
+                return a + b;
+            }
+            return b;
+        }
+    "#,
+    )
+    .expect("c file should be written");
+
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+
+    assert_eq!(report.summary.total_functions, 2);
+
+    let rust_func = report
+        .functions
+        .iter()
+        .find(|f| f.file == "src/main.rs")
+        .expect("rust function should exist");
+    assert_eq!(rust_func.name, "main");
+    assert!(rust_func.cognitive_complexity >= 2);
+
+    let c_func = report
+        .functions
+        .iter()
+        .find(|f| f.file == "src/helper.c")
+        .expect("c function should exist");
+    assert_eq!(c_func.name, "add");
+    assert_eq!(c_func.cyclomatic_complexity, 2);
+}
+
+#[test]
+fn treats_rust_test_files_as_test_only_reachable() {
+    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+    let repo_path = temp_dir.path();
+
+    let tests_dir = repo_path.join("tests");
+    fs::create_dir_all(&tests_dir).expect("tests dir should be created");
+    fs::write(
+        tests_dir.join("integration.rs"),
+        r#"
+        #[test]
+        fn verifies_public_behavior() {
+            assert_eq!(1 + 1, 2);
+        }
+        "#,
+    )
+    .expect("test file should be written");
+
+    let repo = init_repo(repo_path);
+    commit_all(&repo, "initial commit");
+
+    let report =
+        analyze_repository(repo_path, "file", None, shutdown()).expect("analysis should succeed");
+    let function = report
+        .functions
+        .iter()
+        .find(|function| function.name == "verifies_public_behavior")
+        .expect("test function should exist");
+
+    assert!(function.reachability.is_reachable);
+    assert_eq!(function.reachability.kind, "test_only");
+    assert!(report
+        .summary
+        .project_stats
+        .dead_code
+        .functions
+        .iter()
+        .all(|function| function.name != "verifies_public_behavior"));
 }

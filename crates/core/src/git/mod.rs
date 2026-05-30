@@ -1,16 +1,25 @@
-use crate::cache::{GitCacheEntry, GitCacheMetadata, GIT_ALGORITHM_VERSION};
-use crate::metrics::ChurnMetrics;
+use crate::cache::{GitCacheEntry, GitCacheMetadata, LineChange, GIT_ALGORITHM_VERSION};
+use crate::metrics::{ChurnDetails, ChurnMetrics, ChurnWindow, ChurnWindows};
 use anyhow::{anyhow, Result};
-use git2::{Commit, Delta, DiffFindOptions, DiffOptions, Oid, Repository};
+use git2::{Commit, Delta, DiffDelta, DiffFindOptions, DiffHunk, DiffOptions, Oid, Repository};
 use rayon::prelude::*;
+use regex::Regex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use xxhash_rust::xxh3::xxh3_128;
 
 pub struct GitAnalyzer;
 
 const COMMITS_PER_WORKER_CHUNK: usize = 32;
 const COMMITS_PER_BATCH: usize = 4096;
+const FULL_FILE_RANGE_END_LINE: u32 = 1_000_000_000;
+
+#[derive(Clone)]
+pub struct BugFixPatterns {
+    patterns: Vec<Regex>,
+    cache_key: String,
+}
 
 thread_local! {
      static REPO_HANDLE: RefCell<Option<ThreadLocalRepository>> = const { RefCell::new(None) };
@@ -41,8 +50,20 @@ struct GitBatchMetrics {
 }
 
 struct ModifiedFiles {
-    paths: HashSet<String>,
+    files: HashMap<String, Vec<ChangedRange>>,
     renames: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct ChangedRange {
+    start_line: u32,
+    end_line: u32,
+}
+
+pub struct GitAnalysisContext<'a> {
+    pub repo_path: &'a Path,
+    pub branch: &'a str,
+    pub head_oid: &'a str,
 }
 
 impl GitAnalyzer {
@@ -51,99 +72,191 @@ impl GitAnalyzer {
         mut git_cache: HashMap<String, GitCacheEntry>,
         git_metadata: Option<GitCacheMetadata>,
         last_commit_oid: Option<String>,
+        ctx: GitAnalysisContext,
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> Result<GitMetricsResult> {
+        let mut result = Self::initial_git_metrics_result(
+            ctx.repo_path,
+            ctx.branch,
+            ctx.head_oid,
+            bug_fix_patterns,
+        );
+
+        let mut last_commit_oid = last_commit_oid;
+        Self::reset_incompatible_git_cache(
+            &mut git_cache,
+            &mut last_commit_oid,
+            git_metadata.as_ref(),
+            ctx.repo_path,
+            ctx.branch,
+            bug_fix_patterns,
+            &mut result,
+        );
+
+        let mut revwalk = repo.revwalk()?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+        revwalk.push_head()?;
+
+        if Self::prepare_incremental_revwalk(
+            repo,
+            &mut revwalk,
+            &mut git_cache,
+            last_commit_oid.as_deref(),
+            ctx.head_oid,
+            &mut result,
+        )? {
+            result.cache = git_cache;
+            return Ok(result);
+        }
+
+        let new_metrics = Self::collect_batch_metrics(repo.path(), revwalk, bug_fix_patterns)?;
+        Self::apply_batch_metrics_to_result(&mut result, &mut git_cache, new_metrics);
+        Ok(result)
+    }
+
+    fn initial_git_metrics_result(
         repository_path: &Path,
         branch: &str,
         head_oid: &str,
-    ) -> Result<GitMetricsResult> {
-        let mut result = GitMetricsResult {
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> GitMetricsResult {
+        GitMetricsResult {
             cache: HashMap::new(),
             metadata: GitCacheMetadata {
                 repository_path: repository_path.to_string_lossy().to_string(),
                 branch: branch.to_string(),
                 head_oid: head_oid.to_string(),
                 algorithm_version: GIT_ALGORITHM_VERSION,
+                bug_fix_patterns_hash: bug_fix_patterns.cache_key().to_string(),
             },
             cache_reset: false,
             processed_commits: 0,
             partial: false,
             warnings: Vec::new(),
-        };
+        }
+    }
 
-        let mut last_commit_oid = last_commit_oid;
-        if !Self::is_git_cache_compatible(git_metadata.as_ref(), repository_path, branch) {
+    fn reset_incompatible_git_cache(
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        last_commit_oid: &mut Option<String>,
+        git_metadata: Option<&GitCacheMetadata>,
+        repository_path: &Path,
+        branch: &str,
+        bug_fix_patterns: &BugFixPatterns,
+        result: &mut GitMetricsResult,
+    ) {
+        if !Self::is_git_cache_compatible(git_metadata, repository_path, branch, bug_fix_patterns) {
             git_cache.clear();
-            last_commit_oid = None;
+            *last_commit_oid = None;
             result.cache_reset = true;
         }
         if last_commit_oid.is_none() && !git_cache.is_empty() {
             git_cache.clear();
             result.cache_reset = true;
         }
+    }
 
-        let mut revwalk = repo.revwalk()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-        revwalk.push_head()?;
+    fn prepare_incremental_revwalk(
+        repo: &Repository,
+        revwalk: &mut git2::Revwalk<'_>,
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        last_commit_oid: Option<&str>,
+        head_oid: &str,
+        result: &mut GitMetricsResult,
+    ) -> Result<bool> {
+        let Some(oid_str) = last_commit_oid else {
+            return Ok(false);
+        };
+        let head = Oid::from_str(head_oid)?;
 
-        if let Some(oid_str) = last_commit_oid.as_deref() {
-            let head = Oid::from_str(head_oid)?;
-            match Oid::from_str(oid_str) {
-                Ok(oid) if oid == head => {
-                    result.cache = git_cache;
-                    return Ok(result);
-                }
-                Ok(oid) if repo.graph_descendant_of(head, oid).unwrap_or(false) => {
-                    if let Err(err) = revwalk.hide(oid) {
-                        git_cache.clear();
-                        result.cache_reset = true;
-                        result.warnings.push(format!(
-                            "Failed to hide cached Git commit {oid}: {err}. Git cache was rebuilt."
-                        ));
-                    }
-                }
-                Ok(oid) => {
-                    git_cache.clear();
-                    result.cache_reset = true;
-                    result.warnings.push(format!(
-                        "Cached Git commit {oid} is not an ancestor of HEAD. Git cache was rebuilt."
-                    ));
-                }
-                Err(err) => {
-                    git_cache.clear();
-                    result.cache_reset = true;
-                    result.warnings.push(format!(
+        let oid = match Oid::from_str(oid_str) {
+            Ok(oid) => oid,
+            Err(err) => {
+                Self::reset_git_cache(
+                    git_cache,
+                    result,
+                    format!(
                         "Cached Git commit '{oid_str}' is invalid: {err}. Git cache was rebuilt."
-                    ));
-                }
+                    ),
+                );
+                return Ok(false);
             }
+        };
+
+        if oid == head {
+            return Ok(true);
         }
 
-        let repo_path = repo.path().to_path_buf();
+        if !repo.graph_descendant_of(head, oid).unwrap_or(false) {
+            Self::reset_git_cache(
+                git_cache,
+                result,
+                format!(
+                    "Cached Git commit {oid} is not an ancestor of HEAD. Git cache was rebuilt."
+                ),
+            );
+            return Ok(false);
+        }
+
+        if let Err(err) = revwalk.hide(oid) {
+            Self::reset_git_cache(
+                git_cache,
+                result,
+                format!("Failed to hide cached Git commit {oid}: {err}. Git cache was rebuilt."),
+            );
+        }
+
+        Ok(false)
+    }
+
+    fn reset_git_cache(
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        result: &mut GitMetricsResult,
+        warning: String,
+    ) {
+        git_cache.clear();
+        result.cache_reset = true;
+        result.warnings.push(warning);
+    }
+
+    fn collect_batch_metrics(
+        repo_path: &Path,
+        revwalk: git2::Revwalk<'_>,
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> Result<GitBatchMetrics> {
+        let repo_path = repo_path.to_path_buf();
         let mut pending = Vec::with_capacity(COMMITS_PER_BATCH);
         let mut new_metrics = GitBatchMetrics::default();
 
         for oid in revwalk {
             pending.push(oid?);
             if pending.len() >= COMMITS_PER_BATCH {
-                let batch_metrics = Self::process_commit_batch(&repo_path, &pending);
+                let batch_metrics =
+                    Self::process_commit_batch(&repo_path, &pending, bug_fix_patterns);
                 Self::merge_batch_metrics(&mut new_metrics, batch_metrics);
                 pending.clear();
             }
         }
 
         if !pending.is_empty() {
-            let batch_metrics = Self::process_commit_batch(&repo_path, &pending);
+            let batch_metrics = Self::process_commit_batch(&repo_path, &pending, bug_fix_patterns);
             Self::merge_batch_metrics(&mut new_metrics, batch_metrics);
         }
 
+        Ok(new_metrics)
+    }
+
+    fn apply_batch_metrics_to_result(
+        result: &mut GitMetricsResult,
+        git_cache: &mut HashMap<String, GitCacheEntry>,
+        new_metrics: GitBatchMetrics,
+    ) {
         result.processed_commits = new_metrics.processed_commits;
         result.partial = new_metrics.partial;
         result.warnings.extend(new_metrics.warnings);
-
-        Self::merge_git_cache(&mut git_cache, new_metrics.files);
-        Self::apply_rename_aliases(&mut git_cache, &new_metrics.renames);
-        result.cache = git_cache;
-
-        Ok(result)
+        Self::merge_git_cache(git_cache, new_metrics.files);
+        Self::apply_rename_aliases(git_cache, &new_metrics.renames);
+        result.cache = std::mem::take(git_cache);
     }
 
     pub fn compute_churn_metrics(cache_entry: &GitCacheEntry) -> ChurnMetrics {
@@ -151,12 +264,88 @@ impl GitAnalyzer {
         let churn_score = (cache_entry.times_modified as f64
             + (cache_entry.bug_fix_commits as f64 * 2.0))
             * (authors_count as f64 + 1.0).log10();
+        let windows = ChurnWindows::default();
 
         ChurnMetrics {
             times_modified: cache_entry.times_modified,
             bug_fix_commits: cache_entry.bug_fix_commits,
             authors_count,
+            authors: cache_entry.authors.iter().cloned().collect(),
             churn_score,
+            last_modified: None,
+            windows,
+            velocity: "stable".to_string(),
+        }
+    }
+
+    pub fn compute_churn_metrics_for_range(
+        cache_entry: &GitCacheEntry,
+        start_line: u32,
+        end_line: u32,
+    ) -> ChurnMetrics {
+        if cache_entry.line_changes.is_empty() {
+            return Self::compute_churn_metrics(cache_entry);
+        }
+
+        let mut commits = HashSet::new();
+        let mut bug_fix_commits = HashSet::new();
+        let mut authors = HashSet::new();
+        let mut matched_changes = Vec::new();
+
+        for change in &cache_entry.line_changes {
+            if ranges_overlap(start_line, end_line, change.start_line, change.end_line) {
+                commits.insert(change.commit.clone());
+                if change.is_bug_fix {
+                    bug_fix_commits.insert(change.commit.clone());
+                }
+                authors.insert(change.author.clone());
+                matched_changes.push(change);
+            }
+        }
+
+        if commits.is_empty() {
+            return ChurnMetrics {
+                times_modified: 0,
+                bug_fix_commits: 0,
+                authors_count: 0,
+                authors: Vec::new(),
+                churn_score: 0.0,
+                last_modified: None,
+                windows: ChurnWindows::default(),
+                velocity: "stable".to_string(),
+            };
+        }
+
+        let authors_count = authors.len().max(1);
+        let churn_score = (commits.len() as f64 + (bug_fix_commits.len() as f64 * 2.0))
+            * (authors_count as f64 + 1.0).log10();
+        let last_timestamp = matched_changes
+            .iter()
+            .map(|change| change.timestamp)
+            .max()
+            .unwrap_or_default();
+        let windows = churn_windows(&matched_changes, authors_count, last_timestamp);
+        let velocity = churn_velocity(&windows);
+
+        ChurnMetrics {
+            times_modified: commits.len(),
+            bug_fix_commits: bug_fix_commits.len(),
+            authors_count,
+            authors: authors.into_iter().collect(),
+            churn_score,
+            last_modified: format_timestamp(last_timestamp),
+            windows,
+            velocity,
+        }
+    }
+
+    pub fn churn_details(metrics: &ChurnMetrics) -> ChurnDetails {
+        ChurnDetails {
+            score: metrics.churn_score,
+            times_modified: metrics.times_modified,
+            last_modified: metrics.last_modified.clone(),
+            windows: metrics.windows.clone(),
+            velocity: metrics.velocity.clone(),
         }
     }
 
@@ -164,6 +353,7 @@ impl GitAnalyzer {
         metadata: Option<&GitCacheMetadata>,
         repository_path: &Path,
         branch: &str,
+        bug_fix_patterns: &BugFixPatterns,
     ) -> bool {
         let Some(metadata) = metadata else {
             return false;
@@ -173,10 +363,11 @@ impl GitAnalyzer {
             && metadata.repository_path == repository_path.to_string_lossy()
             && metadata.branch == branch
             && !metadata.head_oid.is_empty()
+            && metadata.bug_fix_patterns_hash == bug_fix_patterns.cache_key()
     }
 
     fn get_modified_files_optimized(repo: &Repository, commit: &Commit) -> Result<ModifiedFiles> {
-        let mut files = HashSet::new();
+        let mut files = HashMap::new();
         let mut renames = Vec::new();
         let current_tree = commit.tree()?;
 
@@ -197,24 +388,27 @@ impl GitAnalyzer {
                 if let Some(name) = entry.name() {
                     let path = Path::new(root).join(name);
                     if let Some(path_str) = path.to_str() {
-                        files.insert(path_str.to_string());
+                        files.insert(
+                            path_str.to_string(),
+                            vec![ChangedRange {
+                                start_line: 1,
+                                end_line: FULL_FILE_RANGE_END_LINE,
+                            }],
+                        );
                     }
                 }
                 git2::TreeWalkResult::Ok
             })?;
         }
 
-        Ok(ModifiedFiles {
-            paths: files,
-            renames,
-        })
+        Ok(ModifiedFiles { files, renames })
     }
 
     fn collect_diff_paths(
         repo: &Repository,
         old_tree: Option<&git2::Tree>,
         new_tree: Option<&git2::Tree>,
-        files: &mut HashSet<String>,
+        files: &mut HashMap<String, Vec<ChangedRange>>,
         renames: &mut Vec<(String, String)>,
     ) -> Result<()> {
         let mut opts = DiffOptions::new();
@@ -226,48 +420,76 @@ impl GitAnalyzer {
         find_opts.renames(true);
         diff.find_similar(Some(&mut find_opts))?;
 
-        for delta in diff.deltas() {
-            let new_path = delta
-                .new_file()
-                .path()
-                .and_then(|path| path.to_str())
-                .map(str::to_string);
+        let collected_files = RefCell::new(HashMap::<String, Vec<ChangedRange>>::new());
+        let collected_renames = RefCell::new(Vec::<(String, String)>::new());
+        diff.foreach(
+            &mut |delta, _| {
+                let new_path = delta
+                    .new_file()
+                    .path()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_string);
 
-            if delta.status() == Delta::Renamed {
-                if let (Some(old_path), Some(new_path)) = (
-                    delta
-                        .old_file()
-                        .path()
-                        .and_then(|path| path.to_str())
-                        .map(str::to_string),
-                    new_path.clone(),
-                ) {
-                    renames.push((old_path, new_path));
+                if delta.status() == Delta::Renamed {
+                    if let (Some(old_path), Some(new_path)) = (
+                        delta
+                            .old_file()
+                            .path()
+                            .and_then(|path| path.to_str())
+                            .map(str::to_string),
+                        new_path.clone(),
+                    ) {
+                        collected_renames.borrow_mut().push((old_path, new_path));
+                    }
                 }
-            }
 
-            if let Some(path) = new_path {
-                files.insert(path);
-            }
-        }
+                if let Some(path) = new_path {
+                    collected_files.borrow_mut().entry(path).or_default();
+                }
+                true
+            },
+            None,
+            Some(&mut |delta, hunk| {
+                let Some(path) = hunk_path(delta) else {
+                    return true;
+                };
+                collected_files
+                    .borrow_mut()
+                    .entry(path)
+                    .or_default()
+                    .push(changed_range_from_hunk(hunk));
+                true
+            }),
+            None,
+        )?;
+        files.extend(collected_files.into_inner());
+        renames.extend(collected_renames.into_inner());
 
         Ok(())
     }
 
-    fn process_commit_batch(repo_path: &Path, oids: &[Oid]) -> GitBatchMetrics {
+    fn process_commit_batch(
+        repo_path: &Path,
+        oids: &[Oid],
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> GitBatchMetrics {
         oids.par_chunks(COMMITS_PER_WORKER_CHUNK)
-            .map(|chunk| Self::process_commit_chunk(repo_path, chunk))
+            .map(|chunk| Self::process_commit_chunk(repo_path, chunk, bug_fix_patterns))
             .reduce(GitBatchMetrics::default, |mut acc, metrics| {
                 Self::merge_batch_metrics(&mut acc, metrics);
                 acc
             })
     }
 
-    fn process_commit_chunk(repo_path: &Path, oids: &[Oid]) -> GitBatchMetrics {
+    fn process_commit_chunk(
+        repo_path: &Path,
+        oids: &[Oid],
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> GitBatchMetrics {
         match Self::with_thread_local_repo(repo_path, |repo| {
             let mut metrics = GitBatchMetrics::default();
             for oid in oids {
-                match Self::process_commit(repo, *oid) {
+                match Self::process_commit(repo, *oid, bug_fix_patterns) {
                     Ok(commit_metrics) => {
                         metrics.processed_commits += 1;
                         Self::merge_git_cache(&mut metrics.files, commit_metrics.files);
@@ -295,20 +517,42 @@ impl GitAnalyzer {
         }
     }
 
-    fn process_commit(repo: &Repository, oid: Oid) -> Result<GitBatchMetrics> {
+    fn process_commit(
+        repo: &Repository,
+        oid: Oid,
+        bug_fix_patterns: &BugFixPatterns,
+    ) -> Result<GitBatchMetrics> {
         let commit = repo.find_commit(oid)?;
         let author = Self::author_identity(&commit);
-        let is_bug_fix = Self::is_bug_fix(&commit);
+        let is_bug_fix = Self::is_bug_fix(&commit, bug_fix_patterns);
+        let timestamp = commit.time().seconds();
         let modified_files = Self::get_modified_files_optimized(repo, &commit)?;
 
         let mut metrics = HashMap::new();
-        for file_path in modified_files.paths {
+        let commit_id = oid.to_string();
+        for (file_path, mut ranges) in modified_files.files {
             let entry: &mut GitCacheEntry = metrics.entry(file_path).or_default();
             entry.times_modified += 1;
             if is_bug_fix {
                 entry.bug_fix_commits += 1;
             }
             entry.authors.insert(author.clone());
+            if ranges.is_empty() {
+                ranges.push(ChangedRange {
+                    start_line: 1,
+                    end_line: FULL_FILE_RANGE_END_LINE,
+                });
+            }
+            for range in ranges {
+                entry.line_changes.push(LineChange {
+                    commit: commit_id.clone(),
+                    start_line: range.start_line,
+                    end_line: range.end_line,
+                    is_bug_fix,
+                    author: author.clone(),
+                    timestamp,
+                });
+            }
         }
 
         Ok(GitBatchMetrics {
@@ -335,6 +579,7 @@ impl GitAnalyzer {
             target_entry.times_modified += source_entry.times_modified;
             target_entry.bug_fix_commits += source_entry.bug_fix_commits;
             target_entry.authors.extend(source_entry.authors);
+            target_entry.line_changes.extend(source_entry.line_changes);
         }
     }
 
@@ -358,6 +603,7 @@ impl GitAnalyzer {
             target_entry.times_modified += entry.times_modified;
             target_entry.bug_fix_commits += entry.bug_fix_commits;
             target_entry.authors.extend(entry.authors);
+            target_entry.line_changes.extend(entry.line_changes);
         }
     }
 
@@ -430,31 +676,138 @@ impl GitAnalyzer {
         author.name().unwrap_or("Unknown").to_string()
     }
 
-    fn is_bug_fix(commit: &Commit) -> bool {
-        if let Some(message) = commit.message() {
-            let lower_msg = message.to_lowercase();
-            lower_msg
-                .split(|ch: char| !ch.is_ascii_alphanumeric())
-                .any(|word| {
-                    matches!(
-                        word,
-                        "fix"
-                            | "fixes"
-                            | "fixed"
-                            | "bug"
-                            | "bugs"
-                            | "issue"
-                            | "issues"
-                            | "close"
-                            | "closes"
-                            | "closed"
-                            | "resolve"
-                            | "resolves"
-                            | "resolved"
-                    )
-                })
-        } else {
-            false
+    fn is_bug_fix(commit: &Commit, bug_fix_patterns: &BugFixPatterns) -> bool {
+        commit
+            .message()
+            .is_some_and(|message| bug_fix_patterns.is_match(message))
+    }
+}
+
+impl BugFixPatterns {
+    pub fn from_patterns(patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut compiled = Vec::with_capacity(patterns.len());
+        for pattern in patterns {
+            compiled.push(Regex::new(pattern)?);
+        }
+        Ok(Self {
+            patterns: compiled,
+            cache_key: patterns_cache_key(&patterns.join("\n")),
+        })
+    }
+
+    pub fn cache_key(&self) -> &str {
+        &self.cache_key
+    }
+
+    fn is_match(&self, message: &str) -> bool {
+        self.patterns
+            .iter()
+            .any(|pattern| pattern.is_match(message))
+    }
+}
+
+impl Default for BugFixPatterns {
+    fn default() -> Self {
+        let patterns = [
+            r"(?i)\bfix(?:e[sd])?\b",
+            r"(?i)\bbug(?:s)?\b",
+            r"(?i)\bissue(?:s)?\b",
+            r"(?i)\bclos(?:e[sd]?|ing)\b",
+            r"(?i)\bresolv(?:e[sd]?|ing)\b",
+        ];
+        let compiled = patterns
+            .iter()
+            .map(|pattern| Regex::new(pattern).expect("default bug-fix pattern should compile"))
+            .collect();
+        Self {
+            patterns: compiled,
+            cache_key: patterns_cache_key(&patterns.join("\n")),
         }
     }
+}
+
+fn patterns_cache_key(patterns: &str) -> String {
+    format!("{:032x}", xxh3_128(patterns.as_bytes()))
+}
+
+fn hunk_path(delta: DiffDelta) -> Option<String> {
+    delta
+        .new_file()
+        .path()
+        .or_else(|| delta.old_file().path())
+        .and_then(|path| path.to_str())
+        .map(str::to_string)
+}
+
+fn changed_range_from_hunk(hunk: DiffHunk) -> ChangedRange {
+    let start_line = hunk.new_start().max(1);
+    let line_count = hunk.new_lines().max(1);
+    ChangedRange {
+        start_line,
+        end_line: start_line.saturating_add(line_count).saturating_sub(1),
+    }
+}
+
+fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> bool {
+    left_start <= right_end && right_start <= left_end
+}
+
+fn churn_windows(
+    changes: &[&LineChange],
+    authors_count: usize,
+    reference_timestamp: i64,
+) -> ChurnWindows {
+    ChurnWindows {
+        d7: churn_window(changes, authors_count, reference_timestamp, 7),
+        d30: churn_window(changes, authors_count, reference_timestamp, 30),
+        d90: churn_window(changes, authors_count, reference_timestamp, 90),
+    }
+}
+
+fn churn_window(
+    changes: &[&LineChange],
+    authors_count: usize,
+    reference_timestamp: i64,
+    days: i64,
+) -> ChurnWindow {
+    let cutoff = reference_timestamp.saturating_sub(days * 24 * 60 * 60);
+    let modifications = changes
+        .iter()
+        .filter(|change| change.timestamp >= cutoff)
+        .map(|change| &change.commit)
+        .collect::<HashSet<_>>()
+        .len();
+    ChurnWindow {
+        modifications,
+        score: (modifications as f64) * (authors_count as f64 + 1.0).log10(),
+    }
+}
+
+fn churn_velocity(windows: &ChurnWindows) -> String {
+    if windows.d90.modifications <= 1 {
+        return "stable".to_string();
+    }
+
+    let d7_rate = windows.d7.modifications as f64 / 7.0;
+    let d90_rate = windows.d90.modifications as f64 / 90.0;
+
+    if d90_rate == 0.0 {
+        return "stable".to_string();
+    }
+
+    let ratio = d7_rate / d90_rate;
+    if ratio >= 1.25 {
+        "accelerating".to_string()
+    } else if ratio <= 0.75 {
+        "cooling".to_string()
+    } else {
+        "stable".to_string()
+    }
+}
+
+fn format_timestamp(timestamp: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0).map(|dt| dt.to_rfc3339())
 }

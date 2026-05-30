@@ -1,16 +1,18 @@
-use crate::metrics::FunctionMetrics;
-use std::fs;
-use tree_sitter::{Language, Parser};
-use tree_sitter_typescript::{language_tsx, language_typescript};
-
 use super::engine::ComplexityEngine;
+use super::LanguageSupport;
+use crate::metrics::FunctionMetrics;
+use tree_sitter::Parser;
 
-pub struct TypeScriptAnalyzer;
+pub struct AstParser;
 
-impl TypeScriptAnalyzer {
-    pub fn analyze_source(source: &str, file_path: &str) -> anyhow::Result<Vec<FunctionMetrics>> {
+impl AstParser {
+    pub fn analyze_source(
+        source: &str,
+        file_path: &str,
+        support: &dyn LanguageSupport,
+    ) -> anyhow::Result<Vec<FunctionMetrics>> {
         let mut parser = Parser::new();
-        parser.set_language(Self::language_for_path(file_path))?;
+        parser.set_language(support.language())?;
 
         let tree = parser
             .parse(source, None)
@@ -19,38 +21,15 @@ impl TypeScriptAnalyzer {
             anyhow::bail!("Failed to parse {}: syntax errors detected", file_path);
         }
 
-        let engine = ComplexityEngine::new(source, file_path);
+        let engine = ComplexityEngine::new(source, file_path, support);
         engine.analyze(tree.root_node())
-    }
-
-    pub fn parse_file(path: &str) -> anyhow::Result<Vec<FunctionMetrics>> {
-        let source = fs::read_to_string(path)?;
-        let mut parser = Parser::new();
-        parser.set_language(Self::language_for_path(path))?;
-
-        let tree = parser
-            .parse(&source, None)
-            .ok_or_else(|| anyhow::anyhow!("Failed to parse {}", path))?;
-        if tree.root_node().has_error() {
-            anyhow::bail!("Failed to parse {}: syntax errors detected", path);
-        }
-
-        let engine = ComplexityEngine::new(&source, path);
-        engine.analyze(tree.root_node())
-    }
-
-    fn language_for_path(path: &str) -> Language {
-        if path.ends_with(".tsx") || path.ends_with(".jsx") {
-            language_tsx()
-        } else {
-            language_typescript()
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TypeScriptAnalyzer;
+    use super::AstParser;
+    use crate::ast::typescript::TypeScriptSupport;
 
     #[test]
     fn parses_valid_typescript() {
@@ -59,8 +38,9 @@ mod tests {
                 if (x) {}
             }
         "#;
+        let support = TypeScriptSupport::new(false);
 
-        let functions = TypeScriptAnalyzer::analyze_source(source, "file.ts")
+        let functions = AstParser::analyze_source(source, "file.ts", &support)
             .expect("valid TypeScript should parse");
 
         assert_eq!(functions.len(), 1);
@@ -74,9 +54,10 @@ mod tests {
                 return <div>{value}</div>;
             }
         "#;
+        let support = TypeScriptSupport::new(true);
 
-        let functions =
-            TypeScriptAnalyzer::analyze_source(source, "file.tsx").expect("valid TSX should parse");
+        let functions = AstParser::analyze_source(source, "file.tsx", &support)
+            .expect("valid TSX should parse");
 
         assert_eq!(functions.len(), 1);
     }
@@ -84,8 +65,9 @@ mod tests {
     #[test]
     fn invalid_syntax_returns_error() {
         let source = "function broken( {";
+        let support = TypeScriptSupport::new(false);
 
-        let result = TypeScriptAnalyzer::analyze_source(source, "file.ts");
+        let result = AstParser::analyze_source(source, "file.ts", &support);
 
         assert!(result.is_err());
     }

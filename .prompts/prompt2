@@ -1,0 +1,220 @@
+You are performing a constrained structural refactor.
+
+The `.context/` directory contains deterministic semantic mirror files.
+
+Each `.context/*.rs` file:
+- represents exactly one hotspot target function
+- contains bounded semantic context
+- contains refactor constraints
+- contains required local types/signatures
+- is a reduced semantic projection of repository state
+
+The `.context/` files are authoritative for refactor scope.
+
+They intentionally omit unrelated repository context.
+
+Do NOT attempt to reconstruct omitted architecture.
+
+Your task is to process ALL `.context/*.rs` files.
+
+For each `.context/*.rs` file:
+
+1. Read the context file
+2. Extract hotspot metadata from the header comment
+3. Identify:
+   - hotspot id
+   - original source file
+   - target function
+4. Refactor ONLY the matching target function in the ORIGINAL source file
+5. Reduce cognitive complexity
+6. Preserve exact behavior
+7. Preserve compilation and tests
+8. Continue to the next `.context` file
+
+STRICT RULES
+
+1. Behavioral invariance
+
+Preserve behavior exactly.
+
+Do NOT introduce:
+- semantic changes
+- output changes
+- mutation changes
+- side-effect changes
+- concurrency changes
+- ownership/lifetime changes
+- error propagation changes
+- observable execution changes
+
+Execution order may only change if behavior is provably identical.
+
+2. Architectural invariance
+
+Do NOT:
+- redesign the system
+- alter module boundaries
+- introduce architectural patterns
+- introduce abstractions unrelated to complexity reduction
+- change layering
+- change visibility semantics
+- alter public APIs
+- alter trait contracts
+- alter type semantics
+
+3. Dependency restrictions
+
+Do NOT:
+- add dependencies
+- remove dependencies
+- replace libraries
+- introduce frameworks
+- introduce macros unless already used locally
+
+4. Refactor scope restrictions
+
+Refactor ONLY:
+- functions mirrored in `.context/`
+- the exact function identified by hotspot metadata
+
+Do NOT:
+- refactor unrelated functions
+- modify unrelated files
+- normalize unrelated code
+- opportunistically clean surrounding code
+- perform repository-wide formatting
+
+Only modify external code when strictly required to preserve correctness.
+
+5. `.context/` interpretation rules
+
+The `.context/` files are bounded semantic projections.
+
+Omitted code must be treated as intentionally excluded.
+
+Do NOT:
+- infer missing architecture
+- reconstruct large dependency trees
+- redesign based on assumptions
+- expand scope beyond provided context
+
+Supporting function signatures inside `.context/` are informational.
+
+Example:
+
+```rust
+fn apply_scoring_and_labels(
+    functions: &mut [FunctionMetrics],
+    ctx: &ScoringContext
+) -> Distributions;
+````
+
+This does NOT authorize refactoring that function.
+
+Only the mirrored target function may be refactored.
+
+6. Allowed refactor operations
+
+Allowed:
+
+* extract local helper functions
+* split logical blocks
+* reduce nesting
+* flatten control flow
+* reduce branching complexity
+* isolate repeated logic
+* improve local readability
+* introduce small private helper functions
+* reduce temporary mutable state
+* improve naming locally when behavior remains identical
+
+7. Forbidden refactor operations
+
+Forbidden:
+
+* TODOs
+* placeholders
+* commented-out code
+* dead code
+* speculative improvements
+* feature additions
+* hidden behavior changes
+* changing algorithmic intent
+* changing persistence semantics
+* changing synchronization semantics
+* changing caching semantics
+* changing IO semantics
+* changing error semantics
+* introducing synthetic implementations
+
+8. Refactor strategy constraints
+
+Prefer:
+
+* minimal diffs
+* localized transformations
+* structurally deterministic refactors
+* behavior-preserving extraction
+
+Avoid:
+
+* broad rewrites
+* whole-function rewrites unless strictly necessary
+* stylistic rewrites
+* cosmetic formatting churn
+
+9. Validation requirements
+
+After EACH refactor:
+
+* compile the project
+* run relevant tests
+* verify no regressions were introduced
+
+Do not continue if validation fails.
+
+10. Failure handling
+
+If a refactor cannot be completed safely:
+
+* preserve original behavior
+* avoid speculative modifications
+* leave the function unchanged rather than risk semantic drift
+
+11. Execution workflow
+
+12. Enumerate all `.context/*.rs` files
+
+13. For each file:
+
+    * read semantic mirror
+    * extract hotspot metadata
+    * identify original source file
+    * identify target function
+    * refactor ONLY that function
+    * validate compilation
+    * run relevant tests
+    * continue only if validation succeeds
+
+14. Finish only after all hotspot functions were processed successfully.
+
+15. Primary optimization target
+
+Primary target:
+
+* reduce cognitive complexity
+
+Secondary targets:
+
+* reduce nesting
+* improve local maintainability
+* improve bounded readability
+
+WITHOUT altering:
+
+* semantics
+* contracts
+* architecture
+* execution behavior
+
+

@@ -1,0 +1,184 @@
+You are part of a Deterministic Context Reconstruction System (DCRS).
+
+Your role is to generate bounded semantic contexts for downstream agents.
+
+This is a deterministic context reconstruction stage.
+It is NOT a refactoring, reasoning, or solution stage.
+
+The generated context files will later be consumed by specialized agents responsible for:
+- analysis
+- task generation
+- invariant extraction
+- pattern enrichment
+- refactoring
+- verification
+
+Your objective is to isolate only the operationally relevant semantic region around each high-risk function while minimizing contextual noise.
+
+Unnecessary context is considered harmful.
+
+Additional context must only be included when it is strictly necessary for:
+- local semantic coherence
+- behavioral understanding
+- dependency interpretation
+- future bounded reasoning
+
+Do NOT optimize for compilability of the extracted file.
+Optimize for:
+- semantic isolation
+- low contextual entropy
+- minimalism
+- local reasoning capability
+- deterministic reconstruction fidelity
+
+Read `@hotspots.json`.
+
+For each entry inside `top_hotspots`:
+
+1. Locate the target function using:
+   - `file`
+   - `line`
+   - `name`
+
+2. Create the `.context/` directory if it does not exist.
+
+3. Create a new file inside `.context/` using:
+   `<function_name>.<original_extension>`
+
+4. Copy the COMPLETE implementation of the target function.
+
+5. Include only the minimal supporting definitions required for local semantic understanding.
+
+Allowed supporting artifacts:
+- structs
+- enums
+- traits
+- type aliases
+- constants
+- helper function signatures
+- helper implementations only when directly necessary to understand behavior
+- imports strictly required for semantic interpretation
+
+6. Minimize extracted context aggressively.
+
+Do NOT include:
+- unrelated fields
+- unrelated methods
+- unrelated implementations
+- unrelated modules
+- unrelated traits
+- tests
+- examples
+- documentation
+- unused imports
+- architectural scaffolding
+- recursive dependencies unless strictly necessary
+- code included only for compilability
+
+7. Supporting definitions should be semantically reduced whenever possible.
+
+Example:
+If a struct contains 15 fields but the target function only depends on 2,
+include only the relevant fields.
+
+Preserve only the semantic surface required for bounded reasoning.
+
+8. Preserve the original target function exactly as-is.
+
+Do NOT:
+- refactor
+- simplify
+- reorganize
+- optimize
+- rename symbols
+- normalize style
+- remove dead code
+- rewrite expressions
+- change formatting unnecessarily
+- complete missing logic
+- alter behavior
+
+9. At the top of each generated file, add a short technical comment using exactly this structure:
+
+/*
+ * File: <original file path>
+ * Function: <function name>
+ * Location: line <line number>
+ *
+ * Responsibility:
+ * <objective description of the function behavior>
+ *
+ * Inputs:
+ * <semantic description of important parameters and mutable state>
+ *
+ * Dependencies included in this context:
+ * - <dependency>
+ * - <dependency>
+ *
+ * Hotspot Metrics:
+ * - risk_score: <value>
+ * - churn_score: <value>
+ * - cognitive_complexity: <value>
+ *
+ * Constraints for future refactors:
+ * - Preserve behavior exactly
+ * - Preserve external behavior
+ * - Preserve module boundaries
+ * - Preserve execution semantics
+ * - Do not introduce new dependencies
+ */
+
+10. The generated comment must contain only:
+- objective information directly derivable from the code
+- hotspot metadata
+- observable semantics
+
+Do NOT:
+- infer intent
+- explain architectural quality
+- explain why the code is problematic
+- propose improvements
+- propose refactors
+- generate tasks
+- add subjective analysis
+
+11. The resulting `.context/` files are deterministic semantic projections of the repository state.
+
+Their purpose is to:
+- reduce contextual competition
+- reduce inferential noise
+- isolate operational reasoning regions
+- constrain probabilistic agents to bounded contexts
+
+Make no modifications outside `.context/`.
+
+12. NEVER introduce synthetic implementations.
+
+Do NOT add:
+- todo!()
+- unimplemented!()
+- panic!()
+- placeholder returns
+- mocked logic
+- fake implementations
+- generated stubs
+- inferred behavior
+- fallback branches
+- synthetic defaults
+
+If a dependency is not required for local semantic understanding,
+omit it entirely.
+
+If only a function signature is required for contextual understanding,
+include only the signature without a body.
+
+The extracted context is NOT required to compile.
+
+Semantic fidelity is more important than compilability.
+
+13. Prefer omission over fabrication.
+
+If uncertain whether some code is required:
+- omit it
+- never invent missing behavior
+- never synthesize executable placeholders

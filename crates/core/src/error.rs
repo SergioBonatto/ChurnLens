@@ -1,7 +1,7 @@
 use std::fmt;
 
 #[derive(Debug)]
-pub enum ChurnLensError {
+pub enum UchikomiError {
     ParseError(String),
     GitError(String),
     IoError(String),
@@ -10,35 +10,35 @@ pub enum ChurnLensError {
     Other(String),
 }
 
-impl fmt::Display for ChurnLensError {
+impl fmt::Display for UchikomiError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ChurnLensError::ParseError(msg) => write!(f, "Parse error: {}", msg),
-            ChurnLensError::GitError(msg) => write!(f, "Git error: {}", msg),
-            ChurnLensError::IoError(msg) => write!(f, "IO error: {}", msg),
-            ChurnLensError::CacheError(msg) => write!(f, "Cache error: {}", msg),
-            ChurnLensError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
-            ChurnLensError::Other(msg) => write!(f, "Error: {}", msg),
+            UchikomiError::ParseError(msg) => write!(f, "Parse error: {}", msg),
+            UchikomiError::GitError(msg) => write!(f, "Git error: {}", msg),
+            UchikomiError::IoError(msg) => write!(f, "IO error: {}", msg),
+            UchikomiError::CacheError(msg) => write!(f, "Cache error: {}", msg),
+            UchikomiError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            UchikomiError::Other(msg) => write!(f, "Error: {}", msg),
         }
     }
 }
 
-impl std::error::Error for ChurnLensError {}
+impl std::error::Error for UchikomiError {}
 
-impl From<anyhow::Error> for ChurnLensError {
+impl From<anyhow::Error> for UchikomiError {
     fn from(err: anyhow::Error) -> Self {
-        ChurnLensError::Other(err.to_string())
+        UchikomiError::Other(err.to_string())
     }
 }
 
-impl From<std::io::Error> for ChurnLensError {
+impl From<std::io::Error> for UchikomiError {
     fn from(err: std::io::Error) -> Self {
-        ChurnLensError::IoError(err.to_string())
+        UchikomiError::IoError(err.to_string())
     }
 }
 
-impl From<git2::Error> for ChurnLensError {
+impl From<git2::Error> for UchikomiError {
     fn from(err: git2::Error) -> Self {
-        ChurnLensError::GitError(err.to_string())
+        UchikomiError::GitError(err.to_string())
     }
 }

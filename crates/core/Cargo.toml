@@ -1,5 +1,5 @@
 [package]
-name = "churnlens"
+name = "uchikomi"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,12 +12,14 @@ categories.workspace = true
 keywords.workspace = true
 
 [[bin]]
-name = "churnlens"
+name = "uchikomi"
 path = "src/main.rs"
 
 [dependencies]
 tree-sitter = "0.20"
 tree-sitter-typescript = "0.20"
+tree-sitter-rust = "0.20"
+tree-sitter-c = "0.20"
 git2 = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -25,6 +27,9 @@ clap = { version = "4.4", features = ["derive"] }
 rayon = "1.7"
 anyhow = "1.0"
 regex = "1.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+memmap2 = "0.9"
+toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
